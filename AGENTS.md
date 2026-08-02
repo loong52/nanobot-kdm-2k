@@ -6,9 +6,12 @@ This file provides guidance to AI coding agents working with this repository.
 
 - 面向当前 fork 开发时，任务分支以 `origin/main` 为基线，PR 目标为
   `Trees-23/nanobot-kdm-2k:main`。
-- `upstream` 指向项目所关联的外部上游仓库。除非用户明确说要“拉取上游更新”或“同步上游”，
-  不得对 `upstream` 执行 `fetch`、`pull`，也不得把 `upstream` 的提交 merge 或 rebase 到本项目。
-- 只有用户明确要求向上游贡献时，才以 `upstream/main` 为基线或向 `HKUDS/nanobot` 提交 PR。
+- `upstream` 指向 `Trees-23/nanobot-kdm-2k`（fork 链的直接上游，PR 目标）。除非用户明确说
+  要”拉取上游更新”或”同步上游”，不得对 `upstream` 执行 `fetch`、`pull`，也不得把 `upstream` 的
+  提交 merge 或 rebase 到本项目。
+- `origin` 指向 `loong52/nanobot-kdm-2k`（个人 fork）。
+- `HKUDS/nanobot` 是源头项目，与 `upstream` 无关。只有用户明确要求向源头项目贡献时，才以
+  `HKUDS/nanobot:main` 为基线提交 PR。
 - 不得从脏的本地 `main` 或包含无关本地提交的分支开始任务。默认在当前仓库目录使用
   `git switch` 创建或切换任务分支；除非用户明确要求，不得创建 worktree 或额外项目目录。
 - 如果受保护的本地修改阻止安全切换，先向用户报告，不得自动 stash、reset、clean、覆盖修改或
