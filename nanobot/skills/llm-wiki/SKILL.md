@@ -38,16 +38,25 @@ wiki/
 
 ### 1. 初始化 (`wiki init`)
 
-用户说"初始化 wiki"或"创建知识库"时执行：
+用户说"初始化 wiki"或"创建知识库"时，调用 **`wiki_init` 工具**（推荐）或手动创建：
+
+**方式一：使用工具（推荐）**
+
+调用 `wiki_init` 工具，传入 wiki 根目录路径（默认 `"wiki"`）即可一步完成。
+工具会自动创建目录结构、生成 schema.md/dashboard.md/index.md/debates.md 并初始化 git。
+
+```
+wiki_init(root="wiki")
+```
+
+**方式二：手动创建（工具不可用时）**
 
 1. 创建上述完整目录结构
-2. 生成 `schema.md`，包含：
-   - 页面类型定义（source/entity/concept/comparison/query）
-   - 每种页面的必需字段和格式模板
-   - 链接规范（`[[wikilink]]` 语法、链接方向、反链规则）
-   - 信任标注体系（`[!source]`、`[!analysis]`、`[!unverified]`、`[!gap]`）
+2. 生成 `schema.md`（详见下节）
 3. 生成 `wiki/dashboard.md` 和 `wiki/index.md` 的初始框架
 4. 提交到 git
+
+**工具 vs 手动**: `wiki_init` 一次调用完成所有操作，比 LLM 逐文件创建更快更可靠。
 
 ### 2. 摄入 (`wiki ingest`)
 
@@ -113,7 +122,9 @@ type: source
 
 定期或在用户要求时执行。触发词："检查 wiki"、"wiki lint"、"知识库体检"。
 
-**检查项：**
+**优先使用 `wiki_lint` 工具**，它自动执行以下所有检查并返回结构化报告。然后根据报告修复问题。
+
+**手动检查（工具不可用时）：**
 
 - **死链**：`[[wikilink]]` 指向不存在的页面
 - **孤立页**：没有被任何其他页面链接的页面
@@ -122,6 +133,13 @@ type: source
 - **索引一致性**：`index.md` 是否漏掉了某些页面
 
 用 Grep 搜所有 `[[...]]` 链接，交叉比对实际文件列表。逐项报告问题，让用户决定如何修复。
+
+### 5. 更新索引 (`wiki index`)
+
+触发词："更新索引"、"重建索引"、"wiki index"。
+
+调用 **`wiki_index` 工具**，它会扫描 wiki/ 下所有页面，提取 YAML frontmatter 中的 type 字段，
+按类型分组生成完整的 index.md。在批量摄入后调用。
 
 ## 链接维护规则
 
@@ -139,6 +157,16 @@ git add wiki/ && git commit -m "wiki: ingest <source-name>"
 ```
 
 小提交比大提交好——每个摄入操作一个 commit，方便追溯和回滚。
+
+## 可用工具
+
+本 Skill 配套以下内置工具（`nanobot/agent/tools/wiki.py`），优先使用工具而非手动操作：
+
+| 工具 | 用途 | 何时调用 |
+|------|------|---------|
+| `wiki_init` | 一键初始化 wiki 目录结构 + schema + git | 首次使用、用户说"初始化 wiki" |
+| `wiki_lint` | 检查死链、孤立页、索引一致性 | 摄入后、定期检查、用户说"检查 wiki" |
+| `wiki_index` | 从文件系统重建 index.md | 批量摄入后、索引与实际文件不一致时 |
 
 ## 与其他工具协作
 
