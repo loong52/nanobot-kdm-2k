@@ -88,7 +88,7 @@ def _format_lint_report(report) -> str:
 
 @tool_parameters(
     tool_parameters_schema(
-        root=StringSchema("wiki", description="Wiki 根目录路径（相对于工作区）"),
+        root=StringSchema('Wiki 根目录路径（相对于工作区），默认 "wiki"'),
         force=BooleanSchema(description="如果为 true，即使 wiki 已存在也覆盖 schema.md"),
         required=[],
     )
@@ -157,10 +157,9 @@ class WikiInitTool(Tool):
 
 @tool_parameters(
     tool_parameters_schema(
-        root=StringSchema("wiki", description="Wiki 根目录路径（相对于工作区）"),
+        root=StringSchema('Wiki 根目录路径（相对于工作区），默认 "wiki"'),
         checks=StringSchema(
-            "all",
-            description="要运行的检查，逗号分隔。可选值: all, deadlinks, orphans, index",
+            '要运行的检查，逗号分隔。可选值: all, deadlinks, orphans, index。默认 "all"',
         ),
         required=[],
     )
@@ -207,7 +206,7 @@ class WikiLintTool(Tool):
 
 @tool_parameters(
     tool_parameters_schema(
-        root=StringSchema("wiki", description="Wiki 根目录路径（相对于工作区）"),
+        root=StringSchema('Wiki 根目录路径（相对于工作区），默认 "wiki"'),
         required=[],
     )
 )
