@@ -14,6 +14,7 @@ from nanobot.agent.status_overlay import (
     FailureLedgerHook,
     begin_logical_user_request,
     build_failure_overlay,
+    build_status_overlay,
     record_tool_terminal,
 )
 from nanobot.agent.tools.base import ToolResult
@@ -106,6 +107,66 @@ def test_new_logical_user_request_resets_failure_ledger() -> None:
     assert build_failure_overlay(metadata, second_message) is None
 
 
+def test_goal_and_owner_status_are_partitioned_without_duplicate_replacements() -> None:
+    goal = {
+        "status": "active",
+        "objective": "do not render this",
+        "orchestration": {
+            "tasks": {
+                "owner-old": {
+                    "required": True,
+                    "owner_run_id": "owner-a",
+                    "status": "failed",
+                    "resolved_by_task_id": "owner-replacement",
+                    "result": {"available": True, "delivery_phase": "delivered"},
+                },
+                "owner-replacement": {
+                    "required": True,
+                    "owner_run_id": "owner-a",
+                    "status": "succeeded",
+                    "resolved_by_task_id": None,
+                    "result": {"available": True, "delivery_phase": "claimed_pending_delivery"},
+                },
+                "other-run": {
+                    "required": True,
+                    "owner_run_id": "owner-b",
+                    "status": "running",
+                    "resolved_by_task_id": None,
+                    "result": {"available": False, "delivery_phase": "unclaimed"},
+                },
+                "lost": {
+                    "required": True,
+                    "owner_run_id": "owner-b",
+                    "status": "lost",
+                    "resolved_by_task_id": None,
+                    "result": {"available": True, "delivery_phase": "unclaimed"},
+                },
+            }
+        },
+    }
+    owner_records = {
+        task_id: record
+        for task_id, record in goal["orchestration"]["tasks"].items()
+        if record["owner_run_id"] == "owner-a"
+    }
+
+    overlay = build_status_overlay({}, {}, active_goal=goal, owner_records=owner_records)
+
+    assert overlay is not None
+    assert overlay.scope == "owner_run+active_goal"
+    assert "Owner Run required: succeeded=1 running=0 failed=0; completion=ready; delivery_pending=1" in overlay.content
+    assert "Active Goal required: succeeded=1 running=1 failed=0 lost=1; completion=blocked; delivery_pending=2" in overlay.content
+    assert "owner-old" not in overlay.content
+    assert "owner-replacement" not in overlay.content
+    assert "do not render this" not in overlay.content
+
+    updated = deepcopy(goal)
+    updated["orchestration"]["tasks"]["other-run"]["status"] = "succeeded"
+    changed = build_status_overlay({}, {}, active_goal=updated, owner_records=owner_records)
+    assert changed is not None
+    assert changed.status_revision != overlay.status_revision
+
+
 class _RecordingEmitter:
     def __init__(self) -> None:
         self.events = []
@@ -190,3 +251,37 @@ async def test_codex_overlay_is_transient_and_audited_without_status_body(tmp_pa
         "[Agent Status]" not in str(message)
         for message in model_payloads[-1].content.messages
     )
+
+
+@pytest.mark.asyncio
+async def test_async_status_factory_is_transient_for_codex_requests() -> None:
+    provider = OpenAICodexProvider()
+    calls: list[list[dict]] = []
+
+    async def chat_with_retry(*, messages, **_kwargs):
+        calls.append(deepcopy(messages))
+        return LLMResponse(content="done")
+
+    async def status_factory():
+        return build_status_overlay(
+            {},
+            {},
+            active_goal={"status": "active", "orchestration": {"tasks": {}}},
+        )
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "inspect"}],
+        tools=tools,
+        model="openai-codex/gpt-5.6-sol",
+        max_iterations=1,
+        max_tool_result_chars=10_000,
+        status_overlay_factory=status_factory,
+    ))
+
+    assert calls[0][-1]["role"] == "developer"
+    assert "Active Goal required" in calls[0][-1]["content"]
+    assert all(message.get("role") != "developer" for message in result.messages)

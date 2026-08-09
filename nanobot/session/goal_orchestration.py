@@ -160,6 +160,20 @@ class GoalOrchestrationStore:
                 raise
             return result
 
+    async def _read(
+        self,
+        session_key: str,
+        reader: Callable[[dict[str, Any], dict[str, Any]], Any],
+    ) -> Any:
+        """Read one active Goal snapshot without writing orchestration state."""
+        async with self._lock(session_key):
+            session = self._sessions.get_or_create(session_key)
+            goal = parse_goal_state(goal_state_raw(session.metadata))
+            if not isinstance(goal, dict) or goal.get("status") != "active":
+                raise ValueError("required subagents need an active goal in the current session")
+            goal = deepcopy(goal)
+            return reader(goal, orchestration_snapshot(goal))
+
     async def register(
         self,
         session_key: str,
@@ -376,7 +390,49 @@ class GoalOrchestrationStore:
                     pending.append(replacement_id)
             return selected
 
-        return await self._mutate(session_key, select_records)
+        return await self._read(session_key, select_records)
+
+    async def status_snapshot(
+        self,
+        session_key: str,
+        owner_run_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """Read active Goal and current owner obligations as one stable snapshot.
+
+        Agent Status consumes this projection only.  It must not mark a task lost,
+        advance delivery, or otherwise become a second orchestration state machine.
+        """
+
+        def snapshot(
+            goal: dict[str, Any], orchestration: dict[str, Any]
+        ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+            tasks = orchestration["tasks"]
+            records: dict[str, dict[str, Any]] = {}
+            if owner_run_id:
+                records = {
+                    task_id: deepcopy(record)
+                    for task_id, record in tasks.items()
+                    if isinstance(record, dict)
+                    and record.get("required") is True
+                    and record.get("owner_run_id") == owner_run_id
+                }
+                pending = list(records)
+                while pending:
+                    replacement = tasks.get(pending.pop())
+                    replacement_id = (
+                        replacement.get("resolved_by_task_id")
+                        if isinstance(replacement, dict)
+                        else None
+                    )
+                    if not isinstance(replacement_id, str) or replacement_id in records:
+                        continue
+                    replacement_record = tasks.get(replacement_id)
+                    if isinstance(replacement_record, dict):
+                        records[replacement_id] = deepcopy(replacement_record)
+                        pending.append(replacement_id)
+            return deepcopy(goal), records
+
+        return await self._read(session_key, snapshot)
 
     async def claim_result(self, session_key: str, task_id: str) -> bool | None:
         """Atomically claim one child result; ``None`` means legacy/background task."""

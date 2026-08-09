@@ -91,7 +91,7 @@ class AgentRunSpec:
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
-    status_overlay_factory: Callable[[], Any | None] | None = None
+    status_overlay_factory: Callable[[], Any] | None = None
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
@@ -823,7 +823,7 @@ class AgentRunner:
         return kwargs
 
     @staticmethod
-    def _apply_status_overlay(
+    async def _apply_status_overlay(
         spec: AgentRunSpec,
         messages: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
@@ -832,6 +832,8 @@ class AgentRunner:
             return messages, None
         try:
             overlay = spec.status_overlay_factory()
+            if inspect.isawaitable(overlay):
+                overlay = await overlay
         except Exception:
             logger.exception("Agent Status overlay fact read failed for {}", spec.session_key or "default")
             return messages, {"overlay_result": "omitted_invalid"}
@@ -876,7 +878,7 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
-        request_messages, status_metadata = self._apply_status_overlay(spec, messages)
+        request_messages, status_metadata = await self._apply_status_overlay(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
             request_messages,
@@ -1173,7 +1175,7 @@ class AgentRunner:
             messages=messages,
             session_key=spec.session_key,
         )
-        request_messages, status_metadata = self._apply_status_overlay(spec, messages)
+        request_messages, status_metadata = await self._apply_status_overlay(spec, messages)
         kwargs = self._build_request_kwargs(spec, request_messages, tools=None)
         model_call_id = new_audit_id()
         context.model_call_id = model_call_id

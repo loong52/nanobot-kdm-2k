@@ -29,7 +29,7 @@ from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRun
 from nanobot.agent.status_overlay import (
     FailureLedgerHook,
     begin_logical_user_request,
-    build_failure_overlay,
+    build_status_overlay,
 )
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
@@ -1162,6 +1162,28 @@ class AgentLoop:
 
         session_metadata = session.metadata if session is not None else None
 
+        async def _status_overlay():
+            if session is None:
+                return None
+            active_goal = None
+            owner_records = None
+            if audit_context is not None:
+                try:
+                    active_goal, owner_records = await self.goal_orchestration.status_snapshot(
+                        session.key,
+                        audit_context.run_id,
+                    )
+                except ValueError:
+                    # Ordinary and legacy sessions have no active Goal.  The
+                    # request-scoped failure ledger remains independently useful.
+                    pass
+            return build_status_overlay(
+                session.metadata,
+                None,
+                active_goal=active_goal,
+                owner_records=owner_records,
+            )
+
         async def _completion_guard(candidate: str | None, reason: str) -> dict[str, Any]:
             """Join only required children owned by this concrete Run."""
             from nanobot.session.goal_orchestration import (
@@ -1270,11 +1292,7 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
-                status_overlay_factory=(
-                    lambda: build_failure_overlay(session.metadata, None)
-                    if session is not None
-                    else None
-                ),
+                status_overlay_factory=_status_overlay,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
                 llm_timeout_s=runner_wall_llm_timeout_s(

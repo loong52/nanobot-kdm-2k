@@ -7,6 +7,8 @@ user-request boundary after a process restart.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, Mapping, MutableMapping
@@ -139,12 +141,78 @@ def build_failure_overlay(
     message_metadata: Mapping[str, Any] | None,
 ) -> AgentStatusOverlay | None:
     """Render the current repeated-failure facts without exposing raw inputs."""
-    if inherit_logical_user_request(message_metadata, session_metadata) is None:
+    return build_status_overlay(session_metadata, message_metadata)
+
+
+def build_status_overlay(
+    session_metadata: Mapping[str, Any] | None,
+    message_metadata: Mapping[str, Any] | None,
+    *,
+    active_goal: Mapping[str, Any] | None = None,
+    owner_records: Mapping[str, Mapping[str, Any]] | None = None,
+) -> AgentStatusOverlay | None:
+    """Render one bounded model-only projection from durable request and Goal facts.
+
+    ``active_goal`` and ``owner_records`` are snapshots supplied by
+    :class:`GoalOrchestrationStore`.  They are intentionally read-only; task
+    lifecycle, delivery, and completion remain owned by their existing paths.
+    """
+    lines = ["[Agent Status]"]
+    scopes: list[str] = []
+    source_event_ids: list[str] = []
+    revision_facts: dict[str, Any] = {}
+    failure_lines, failure_sources, failure_revision = _repeated_failure_lines(
+        session_metadata,
+        message_metadata,
+    )
+    if failure_lines:
+        lines.extend(failure_lines)
+        scopes.append("logical_request")
+        source_event_ids.extend(failure_sources)
+        revision_facts["logical_request"] = {
+            "ledger_revision": failure_revision,
+            "sources": failure_sources,
+            "lines": failure_lines,
+        }
+
+    owner_projection = _obligation_projection(owner_records)
+    if owner_projection is not None:
+        lines.append(_render_owner_run_line(owner_projection))
+        scopes.append("owner_run")
+        revision_facts["owner_run"] = owner_projection
+
+    goal_projection = _goal_projection(active_goal)
+    if goal_projection is not None:
+        lines.append(_render_active_goal_line(goal_projection))
+        scopes.append("active_goal")
+        revision_facts["active_goal"] = goal_projection
+
+    if not scopes:
         return None
+    lines.append("[/Agent Status]")
+    content = "\n".join(lines)
+    if len(content) > 1000:
+        return None
+    return AgentStatusOverlay(
+        content=content,
+        status_revision=_snapshot_revision(revision_facts),
+        source_event_ids=tuple(_unique_source_event_ids(source_event_ids)),
+        generated_at=_utc_now(),
+        scope="+".join(scopes),
+    )
+
+
+def _repeated_failure_lines(
+    session_metadata: Mapping[str, Any] | None,
+    message_metadata: Mapping[str, Any] | None,
+) -> tuple[list[str], list[str], int]:
+    """Return repeated-failure display facts without source parameters."""
+    if inherit_logical_user_request(message_metadata, session_metadata) is None:
+        return [], [], 0
     ledger = _validated_ledger(session_metadata)
     if ledger is None:
-        return None
-    failures = []
+        return [], [], 0
+    failures: list[tuple[str, int, str, Mapping[str, Any]]] = []
     source_event_ids: list[str] = []
     for entry in ledger["failures"].values():
         if not isinstance(entry, Mapping):
@@ -156,9 +224,9 @@ def build_failure_overlay(
             continue
         failures.append((name, count, _safe_error_class(entry.get("last_error_class")), entry))
     if not failures:
-        return None
+        return [], [], _non_negative_int(ledger.get("revision"))
     failures.sort(key=lambda item: (-item[1], item[0]))
-    lines = ["[Agent Status]"]
+    lines = []
     for name, count, error_class, entry in failures[:_MAX_RENDERED_FAILURES]:
         lines.append(
             f"Repeated failure: {name} same-operation failures={count}; class={error_class}"
@@ -166,16 +234,134 @@ def build_failure_overlay(
         for event_id in entry.get("source_event_ids", []):
             if isinstance(event_id, str) and event_id and event_id not in source_event_ids:
                 source_event_ids.append(event_id)
-    lines.append("[/Agent Status]")
-    content = "\n".join(lines)
-    if len(content) > 1000:
+    return lines, source_event_ids, _non_negative_int(ledger.get("revision"))
+
+
+def _goal_projection(active_goal: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(active_goal, Mapping) or active_goal.get("status") != "active":
         return None
-    return AgentStatusOverlay(
-        content=content,
-        status_revision=_non_negative_int(ledger.get("revision")),
-        source_event_ids=tuple(source_event_ids[:_MAX_SOURCE_EVENT_IDS]),
-        generated_at=_utc_now(),
+    orchestration = active_goal.get("orchestration")
+    tasks = orchestration.get("tasks") if isinstance(orchestration, Mapping) else None
+    return _obligation_projection(tasks if isinstance(tasks, Mapping) else {}) or {
+        "counts": _empty_status_counts(),
+        "completion": "ready",
+        "delivery_pending": 0,
+    }
+
+
+def _obligation_projection(
+    records: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(records, Mapping):
+        return None
+    tasks = {
+        str(task_id): dict(record)
+        for task_id, record in records.items()
+        if isinstance(record, Mapping) and record.get("required") is True
+    }
+    if not tasks:
+        return None
+    roots = _root_obligation_ids(tasks)
+    counts = _empty_status_counts()
+    delivery_pending = 0
+    for task_id in roots:
+        status, chain = _resolved_obligation_status(tasks, task_id)
+        counts[status] = counts.get(status, 0) + 1
+        leaf = tasks.get(chain[-1]) if chain else None
+        result = leaf.get("result") if isinstance(leaf, Mapping) else None
+        if isinstance(result, Mapping) and result.get("available") is True:
+            phase = str(result.get("delivery_phase") or "unclaimed")
+            if phase != "delivered":
+                delivery_pending += 1
+    return {
+        "counts": counts,
+        "completion": "ready" if counts["succeeded"] == len(roots) else "blocked",
+        "delivery_pending": delivery_pending,
+    }
+
+
+def _root_obligation_ids(tasks: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    replaced = {
+        record.get("resolved_by_task_id")
+        for record in tasks.values()
+        if isinstance(record.get("resolved_by_task_id"), str)
+        and record.get("resolved_by_task_id") in tasks
+    }
+    return sorted(task_id for task_id in tasks if task_id not in replaced)
+
+
+def _resolved_obligation_status(
+    tasks: Mapping[str, Mapping[str, Any]],
+    task_id: str,
+) -> tuple[str, list[str]]:
+    chain: list[str] = []
+    seen: set[str] = set()
+    current = task_id
+    while current and current not in seen:
+        seen.add(current)
+        chain.append(current)
+        record = tasks.get(current)
+        if not isinstance(record, Mapping):
+            return "lost", chain
+        status = str(record.get("status") or "lost")
+        if status == "succeeded":
+            return "succeeded", chain
+        replacement = record.get("resolved_by_task_id")
+        if isinstance(replacement, str) and replacement:
+            current = replacement
+            continue
+        return status if status in _STATUS_ORDER else "lost", chain
+    return "lost", chain
+
+
+_STATUS_ORDER = ("succeeded", "running", "failed", "cancelled", "timed_out", "lost")
+
+
+def _empty_status_counts() -> dict[str, int]:
+    return {status: 0 for status in _STATUS_ORDER}
+
+
+def _render_owner_run_line(projection: Mapping[str, Any]) -> str:
+    return (
+        "Owner Run required: "
+        f"{_render_counts(projection.get('counts'))}; "
+        f"completion={projection.get('completion', 'blocked')}; "
+        f"delivery_pending={_non_negative_int(projection.get('delivery_pending'))}"
     )
+
+
+def _render_active_goal_line(projection: Mapping[str, Any]) -> str:
+    return (
+        "Active Goal required: "
+        f"{_render_counts(projection.get('counts'))}; "
+        f"completion={projection.get('completion', 'blocked')}; "
+        f"delivery_pending={_non_negative_int(projection.get('delivery_pending'))}"
+    )
+
+
+def _render_counts(value: Any) -> str:
+    counts = value if isinstance(value, Mapping) else {}
+    fields = [f"{status}={_non_negative_int(counts.get(status))}" for status in _STATUS_ORDER[:3]]
+    fields.extend(
+        f"{status}={_non_negative_int(counts.get(status))}"
+        for status in _STATUS_ORDER[3:]
+        if _non_negative_int(counts.get(status))
+    )
+    return " ".join(fields)
+
+
+def _snapshot_revision(facts: Mapping[str, Any]) -> int:
+    """Return a deterministic revision for one already-committed fact snapshot."""
+    raw = json.dumps(facts, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return int(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12], 16)
+
+
+def _unique_source_event_ids(value: list[str]) -> list[str]:
+    ids: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item and item not in ids:
+            ids.append(item)
+    return ids[:_MAX_SOURCE_EVENT_IDS]
 
 
 class FailureLedgerHook(AgentHook):
