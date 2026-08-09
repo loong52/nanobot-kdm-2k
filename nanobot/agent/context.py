@@ -1,8 +1,11 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import hashlib
+import json
 import mimetypes
 import platform
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -21,10 +24,112 @@ from nanobot.runtime_context import (
 )
 from nanobot.utils.helpers import (
     detect_image_mime,
+    estimate_message_tokens,
     load_bundled_template,
     truncate_text_to_tokens,
 )
 from nanobot.utils.prompt_templates import render_template
+
+SYSTEM_CONTEXT_SECTIONS_META = "system_context_sections"
+SYSTEM_CONTEXT_SECTIONS_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class SystemPromptSections:
+    """Stable instruction prefix and dynamic facts for one system prompt."""
+
+    stable: str
+    dynamic: str
+
+    @property
+    def content(self) -> str:
+        return _join_prompt_sections(self.stable, self.dynamic)
+
+    def metadata(self) -> dict[str, int | str]:
+        return {
+            "schema_version": SYSTEM_CONTEXT_SECTIONS_VERSION,
+            "stable_chars": len(self.stable),
+            "stable_system_digest": _digest_text(self.stable),
+            "dynamic_fact_digest": _digest_text(self.dynamic),
+            "stable_tokens": estimate_message_tokens({"role": "system", "content": self.stable}),
+            "dynamic_tokens": estimate_message_tokens({"role": "system", "content": self.dynamic}),
+        }
+
+
+def model_request_context_cache_metadata(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    overlay_tokens: int = 0,
+) -> dict[str, int | str]:
+    """Return bounded cache diagnostics without retaining any prompt body."""
+    sections = _system_sections_metadata_from_messages(messages)
+    if sections is None:
+        system_text = "\n".join(
+            str(message.get("content") or "")
+            for message in messages
+            if message.get("role") == "system"
+        )
+        sections = {
+            "schema_version": 0,
+            "stable_system_digest": _digest_text(system_text),
+            "dynamic_fact_digest": _digest_text(""),
+            "stable_tokens": estimate_message_tokens({"role": "system", "content": system_text}),
+            "dynamic_tokens": 0,
+        }
+    return {
+        **sections,
+        "tool_schema_digest": tool_schema_digest(tools),
+        "overlay_tokens": max(0, int(overlay_tokens)),
+        "cached_tokens": "unknown",
+    }
+
+
+def tool_schema_digest(tools: list[dict[str, Any]] | None) -> str:
+    """Hash complete tool schemas; stable ordering alone is not a schema version."""
+    raw = json.dumps(tools or [], ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _system_sections_metadata_from_messages(
+    messages: list[dict[str, Any]],
+) -> dict[str, int | str] | None:
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        meta = message.get("_meta")
+        value = meta.get(SYSTEM_CONTEXT_SECTIONS_META) if isinstance(meta, Mapping) else None
+        if not isinstance(value, Mapping):
+            continue
+        if value.get("schema_version") != SYSTEM_CONTEXT_SECTIONS_VERSION:
+            continue
+        stable_digest = value.get("stable_system_digest")
+        dynamic_digest = value.get("dynamic_fact_digest")
+        if not isinstance(stable_digest, str) or not isinstance(dynamic_digest, str):
+            continue
+        return {
+            "schema_version": SYSTEM_CONTEXT_SECTIONS_VERSION,
+            "stable_system_digest": stable_digest,
+            "dynamic_fact_digest": dynamic_digest,
+            "stable_tokens": _non_negative_int(value.get("stable_tokens")),
+            "dynamic_tokens": _non_negative_int(value.get("dynamic_tokens")),
+        }
+    return None
+
+
+def _join_prompt_sections(stable: str, dynamic: str) -> str:
+    return "\n\n---\n\n".join(part for part in (stable, dynamic) if part)
+
+
+def _digest_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -70,28 +175,51 @@ class ContextBuilder:
         unified_session: bool = False,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        return self.build_system_sections(
+            skill_names,
+            channel=channel,
+            session_summary=session_summary,
+            workspace=workspace,
+            include_memory_recent_history=include_memory_recent_history,
+            session_key=session_key,
+            unified_session=unified_session,
+        ).content
+
+    def build_system_sections(
+        self,
+        skill_names: list[str] | None = None,
+        channel: str | None = None,
+        session_summary: str | None = None,
+        workspace: Path | None = None,
+        include_memory_recent_history: bool = True,
+        session_key: str | None = None,
+        unified_session: bool = False,
+    ) -> SystemPromptSections:
+        """Build stable instructions separately from dynamic memory facts."""
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
+        stable_parts = [self._get_identity(channel=channel, workspace=root)]
 
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
-            parts.append(bootstrap)
+            stable_parts.append(bootstrap)
 
-        parts.append(render_template("agent/tool_contract.md"))
+        stable_parts.append(render_template("agent/tool_contract.md"))
+
+        dynamic_parts: list[str] = []
 
         memory = self.memory.get_memory_context()
         if memory and not self._is_template_content(self.memory.read_memory(), "memory/MEMORY.md"):
-            parts.append(f"# Memory\n\n{memory}")
+            dynamic_parts.append(f"# Memory\n\n{memory}")
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
-                parts.append(f"# Active Skills\n\n{always_content}")
+                stable_parts.append(f"# Active Skills\n\n{always_content}")
 
         skills_summary = self.skills.build_skills_summary(exclude=set(always_skills))
         if skills_summary:
-            parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
+            stable_parts.append(render_template("agent/skills_section.md", skills_summary=skills_summary))
 
         if include_memory_recent_history:
             entries = self.memory.read_recent_history_for_prompt(
@@ -105,12 +233,15 @@ class ContextBuilder:
                     f"- [{e['timestamp']}] {e['content']}" for e in capped
                 )
                 history_text = truncate_text_to_tokens(history_text, self._MAX_HISTORY_TOKENS)
-                parts.append("# Recent History\n\n" + history_text)
+                dynamic_parts.append("# Recent History\n\n" + history_text)
 
         if session_summary:
-            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+            dynamic_parts.append(f"[Archived Context Summary]\n\n{session_summary}")
 
-        return "\n\n---\n\n".join(parts)
+        return SystemPromptSections(
+            stable="\n\n---\n\n".join(stable_parts),
+            dynamic="\n\n---\n\n".join(dynamic_parts),
+        )
 
     def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
         """Get the core identity section."""
@@ -189,18 +320,20 @@ class ContextBuilder:
         user_content = self._build_user_content(current_message, media)
         blocks = list(runtime_context_blocks or ()) if current_role == "user" else []
         merged, runtime_context_meta = append_runtime_context(user_content, blocks)
+        sections = self.build_system_sections(
+            skill_names,
+            channel=channel,
+            session_summary=session_summary,
+            workspace=root,
+            include_memory_recent_history=include_memory_recent_history,
+            session_key=session_key,
+            unified_session=unified_session,
+        )
         messages = [
             {
                 "role": "system",
-                "content": self.build_system_prompt(
-                    skill_names,
-                    channel=channel,
-                    session_summary=session_summary,
-                    workspace=root,
-                    include_memory_recent_history=include_memory_recent_history,
-                    session_key=session_key,
-                    unified_session=unified_session,
-                ),
+                "content": sections.content,
+                "_meta": {SYSTEM_CONTEXT_SECTIONS_META: sections.metadata()},
             },
             *history,
         ]

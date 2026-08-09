@@ -231,7 +231,7 @@ async def test_codex_request_uses_configured_proxy(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatch) -> None:
+async def test_codex_prompt_cache_key_uses_stable_system_and_tool_schema(monkeypatch) -> None:
     bodies: list[dict] = []
 
     _mock_codex_token(monkeypatch)
@@ -253,27 +253,35 @@ async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatc
     monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
 
     provider = OpenAICodexProvider()
+    stable_meta = {
+        "system_context_sections": {
+            "stable_system_digest": "stable-system-v1",
+        }
+    }
     await provider.chat(
         [
-            {"role": "system", "content": "You are nanobot."},
+            {"role": "system", "content": "You are nanobot.\n\n---\n\nrecent-a", "_meta": stable_meta},
             {"role": "user", "content": "first request"},
             {"role": "assistant", "content": "first answer"},
         ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
     )
     await provider.chat(
         [
-            {"role": "system", "content": "You are nanobot."},
-            {"role": "user", "content": "first request"},
-            {"role": "assistant", "content": "first answer"},
-            {"role": "user", "content": "follow up"},
-        ],
-    )
-    await provider.chat(
-        [
-            {"role": "system", "content": "You are nanobot."},
+            {"role": "system", "content": "You are nanobot.\n\n---\n\nrecent-b", "_meta": stable_meta},
             {"role": "user", "content": "different request"},
             {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "follow up"},
+            {"role": "developer", "content": "[Agent Status] transient [/Agent Status]"},
         ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+    )
+    await provider.chat(
+        [
+            {"role": "system", "content": "You are nanobot.\n\n---\n\nrecent-b", "_meta": stable_meta},
+            {"role": "user", "content": "different request"},
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
     )
 
     assert bodies[0]["prompt_cache_key"] == bodies[1]["prompt_cache_key"]

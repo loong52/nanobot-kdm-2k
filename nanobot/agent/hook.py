@@ -21,6 +21,7 @@ class ModelRequestSnapshot:
     tools: list[dict[str, Any]]
     runtime: LLMRuntime
     agent_status: dict[str, Any] | None = None
+    context_cache: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

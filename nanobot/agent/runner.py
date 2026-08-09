@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent.context import model_request_context_cache_metadata
 from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
@@ -854,6 +855,9 @@ class AgentRunner:
             result = "omitted_invalid"
             request_messages = messages
         audit_metadata = overlay.audit_metadata(result)
+        audit_metadata["overlay_tokens"] = estimate_message_tokens(
+            {"role": "developer", "content": overlay.content}
+        )
         return request_messages, audit_metadata
 
     async def _request_model(
@@ -894,6 +898,11 @@ class AgentRunner:
                 tools=deepcopy(kwargs["tools"] or []),
                 runtime=spec.runtime,
                 agent_status=status_metadata,
+                context_cache=model_request_context_cache_metadata(
+                    messages,
+                    kwargs["tools"] or [],
+                    overlay_tokens=(status_metadata or {}).get("overlay_tokens", 0),
+                ),
             ),
         )
         if context.provider_attempt_observer is not None:
@@ -1187,6 +1196,11 @@ class AgentRunner:
                 tools=[],
                 runtime=spec.runtime,
                 agent_status=status_metadata,
+                context_cache=model_request_context_cache_metadata(
+                    messages,
+                    [],
+                    overlay_tokens=(status_metadata or {}).get("overlay_tokens", 0),
+                ),
             ),
         )
         if context.provider_attempt_observer is not None:

@@ -192,6 +192,7 @@ class RunnerAuditHook(AgentHook):
                 "system_prompt_hash": "",
                 "context_governance_actions": [],
                 "agent_status": request.agent_status or {},
+                "context_cache": request.context_cache,
             },
         )
         await self._emitter.emit(event, payload=payload)

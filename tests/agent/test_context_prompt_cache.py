@@ -8,7 +8,11 @@ from datetime import datetime as real_datetime
 from importlib.resources import files as pkg_files
 from pathlib import Path
 
-from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context import (
+    SYSTEM_CONTEXT_SECTIONS_META,
+    ContextBuilder,
+    model_request_context_cache_metadata,
+)
 from nanobot.runtime_context import RuntimeContextBlock
 
 
@@ -47,6 +51,43 @@ def test_system_prompt_stays_stable_when_clock_changes(tmp_path, monkeypatch) ->
     prompt2 = builder.build_system_prompt()
 
     assert prompt1 == prompt2
+
+
+def test_system_sections_keep_dynamic_memory_out_of_stable_digest(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    initial = builder.build_system_sections()
+    builder.memory.append_history("recent fact")
+    updated = builder.build_system_sections()
+
+    assert initial.stable == updated.stable
+    assert initial.metadata()["stable_system_digest"] == updated.metadata()["stable_system_digest"]
+    assert initial.dynamic != updated.dynamic
+    assert initial.metadata()["dynamic_fact_digest"] != updated.metadata()["dynamic_fact_digest"]
+
+    messages = builder.build_messages([], "hello")
+    section_meta = messages[0]["_meta"][SYSTEM_CONTEXT_SECTIONS_META]
+    assert section_meta["stable_system_digest"] == updated.metadata()["stable_system_digest"]
+    assert section_meta["dynamic_fact_digest"] == updated.metadata()["dynamic_fact_digest"]
+
+
+def test_bootstrap_and_tool_schema_changes_invalidate_cache_metadata(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    before = builder.build_messages([], "hello")
+    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+    before_meta = model_request_context_cache_metadata(before, tools)
+
+    (workspace / "AGENTS.md").write_text("workspace instruction", encoding="utf-8")
+    after = builder.build_messages([], "hello")
+    after_meta = model_request_context_cache_metadata(after, tools)
+    changed_tools = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+
+    assert before_meta["stable_system_digest"] != after_meta["stable_system_digest"]
+    assert before_meta["tool_schema_digest"] != model_request_context_cache_metadata(
+        after, changed_tools
+    )["tool_schema_digest"]
+    assert after_meta["cached_tokens"] == "unknown"
 
 
 def test_system_prompt_reflects_current_dream_memory_contract(tmp_path) -> None:

@@ -247,6 +247,9 @@ async def test_codex_overlay_is_transient_and_audited_without_status_body(tmp_pa
         if event.event_type == "model_request_started"
     ]
     assert model_payloads[-1].content.agent_status["overlay_result"] == "applied"
+    assert model_payloads[-1].content.agent_status["overlay_tokens"] > 0
+    assert model_payloads[-1].content.context_cache["cached_tokens"] == "unknown"
+    assert model_payloads[-1].content.context_cache["tool_schema_digest"]
     assert all(
         "[Agent Status]" not in str(message)
         for message in model_payloads[-1].content.messages

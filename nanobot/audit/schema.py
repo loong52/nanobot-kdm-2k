@@ -361,6 +361,7 @@ class ModelRequestPayload(BaseModel):
     system_prompt_hash: str
     context_governance_actions: list[JsonValue]
     agent_status: dict[str, JsonValue]
+    context_cache: dict[str, JsonValue]
 
 
 class ModelResponsePayload(BaseModel):
