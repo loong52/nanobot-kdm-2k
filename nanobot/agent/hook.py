@@ -20,6 +20,7 @@ class ModelRequestSnapshot:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]]
     runtime: LLMRuntime
+    agent_status: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +29,7 @@ class RuntimeDecision:
     fields: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ToolAuditOutcome:
     status: str
     result: Any
@@ -40,6 +41,7 @@ class ToolAuditOutcome:
     fatal: bool = False
     failure_policy: str | None = None
     failure: NormalizedToolFailure | None = None
+    source_event_id: str | None = None
 
 
 @dataclass(slots=True)

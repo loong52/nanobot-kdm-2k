@@ -16,6 +16,7 @@ from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
     ToolCallRequest,
+    TransientOverlayApplication,
     resolve_stream_idle_timeout_s,
 )
 from nanobot.providers.openai_responses import (
@@ -41,6 +42,20 @@ class OpenAICodexProvider(LLMProvider):
         super().__init__(api_key=None, api_base=None)
         self.default_model = default_model
         self.proxy = proxy or None
+
+    def apply_transient_overlay(
+        self,
+        messages: list[dict[str, Any]],
+        overlay: Any,
+    ) -> TransientOverlayApplication:
+        """Represent trusted request status as a Responses developer item."""
+        content = getattr(overlay, "content", None)
+        if not isinstance(content, str) or not content.strip() or len(content) > 1000:
+            return TransientOverlayApplication(list(messages), "omitted_invalid")
+        return TransientOverlayApplication(
+            [*messages, {"role": "developer", "content": content}],
+            "applied",
+        )
 
     async def _call_codex(
         self,

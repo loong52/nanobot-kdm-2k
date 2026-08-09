@@ -191,6 +191,7 @@ class RunnerAuditHook(AgentHook):
                 },
                 "system_prompt_hash": "",
                 "context_governance_actions": [],
+                "agent_status": request.agent_status or {},
             },
         )
         await self._emitter.emit(event, payload=payload)
@@ -518,6 +519,7 @@ class RunnerAuditHook(AgentHook):
         event = ToolFinishedDraft.model_validate(
             {
                 **self._common("tool_finished", iteration=context.iteration),
+                "event_id": outcome.source_event_id or new_audit_id(),
                 "tool_call_id": audit_tool_id,
                 "tool_name": tool_call.name,
                 "elapsed_ms": max(0, (time.monotonic_ns() - started) // 1_000_000),
@@ -543,6 +545,7 @@ class RunnerAuditHook(AgentHook):
                 "recovery_evidence_kind": recovery_evidence_kind,
             }
         )
+        outcome.source_event_id = event.event_id
         payload = ToolOutputPayloadDraft(
             payload_id=new_audit_id(),
             event_id=event.event_id,

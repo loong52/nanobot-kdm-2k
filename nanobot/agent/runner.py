@@ -91,6 +91,7 @@ class AgentRunSpec:
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    status_overlay_factory: Callable[[], Any | None] | None = None
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
@@ -821,6 +822,38 @@ class AgentRunner:
         kwargs["reasoning_effort"] = generation.reasoning_effort
         return kwargs
 
+    @staticmethod
+    def _apply_status_overlay(
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Build one provider-owned transient request overlay, if facts require it."""
+        if spec.status_overlay_factory is None:
+            return messages, None
+        try:
+            overlay = spec.status_overlay_factory()
+        except Exception:
+            logger.exception("Agent Status overlay fact read failed for {}", spec.session_key or "default")
+            return messages, {"overlay_result": "omitted_invalid"}
+        if overlay is None:
+            return messages, None
+        try:
+            application = spec.runtime.provider.apply_transient_overlay(messages, overlay)
+            result = application.result
+            request_messages = application.messages
+            if result not in {"applied", "omitted_unsupported", "omitted_invalid"}:
+                raise ValueError("invalid overlay result")
+            if not isinstance(request_messages, list) or not all(
+                isinstance(message, dict) for message in request_messages
+            ):
+                raise ValueError("invalid overlay request messages")
+        except Exception:
+            logger.exception("Agent Status overlay application failed for {}", spec.session_key or "default")
+            result = "omitted_invalid"
+            request_messages = messages
+        audit_metadata = overlay.audit_metadata(result)
+        return request_messages, audit_metadata
+
     async def _request_model(
         self,
         spec: AgentRunSpec,
@@ -843,9 +876,10 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        request_messages, status_metadata = self._apply_status_overlay(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
-            messages,
+            request_messages,
             tools=spec.tools.get_definitions(),
         )
         model_call_id = new_audit_id()
@@ -857,6 +891,7 @@ class AgentRunner:
                 messages=deepcopy(messages),
                 tools=deepcopy(kwargs["tools"] or []),
                 runtime=spec.runtime,
+                agent_status=status_metadata,
             ),
         )
         if context.provider_attempt_observer is not None:
@@ -1138,7 +1173,8 @@ class AgentRunner:
             messages=messages,
             session_key=spec.session_key,
         )
-        kwargs = self._build_request_kwargs(spec, messages, tools=None)
+        request_messages, status_metadata = self._apply_status_overlay(spec, messages)
+        kwargs = self._build_request_kwargs(spec, request_messages, tools=None)
         model_call_id = new_audit_id()
         context.model_call_id = model_call_id
         await hook.before_model_request(
@@ -1148,6 +1184,7 @@ class AgentRunner:
                 messages=deepcopy(messages),
                 tools=[],
                 runtime=spec.runtime,
+                agent_status=status_metadata,
             ),
         )
         if context.provider_attempt_observer is not None:
@@ -1321,7 +1358,12 @@ class AgentRunner:
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
-        outcome = ToolAuditOutcome("error", None, "internal_error")
+        outcome = ToolAuditOutcome(
+            "error",
+            None,
+            "internal_error",
+            source_event_id=new_audit_id(),
+        )
         try:
             result = await self._run_tool_inner(
                 spec,
@@ -1405,6 +1447,8 @@ class AgentRunner:
             )
             raise
         finally:
+            if outcome.source_event_id is None:
+                outcome.source_event_id = new_audit_id()
             await hook.after_execute_tool_terminal(
                 context,
                 tool_call,

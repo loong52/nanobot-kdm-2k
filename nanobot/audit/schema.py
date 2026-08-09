@@ -360,6 +360,7 @@ class ModelRequestPayload(BaseModel):
     generation_settings: dict[str, JsonValue]
     system_prompt_hash: str
     context_governance_actions: list[JsonValue]
+    agent_status: dict[str, JsonValue]
 
 
 class ModelResponsePayload(BaseModel):

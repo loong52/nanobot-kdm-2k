@@ -12,7 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import json_repair
 from loguru import logger
@@ -183,6 +183,14 @@ class LLMResponse:
         return self.finish_reason in ("tool_calls", "function_call", "stop")
 
 
+@dataclass(frozen=True, slots=True)
+class TransientOverlayApplication:
+    """Provider-owned request copy and the outcome of an overlay attempt."""
+
+    messages: list[dict[str, Any]]
+    result: Literal["applied", "omitted_unsupported", "omitted_invalid"]
+
+
 @dataclass(frozen=True)
 class GenerationSettings:
     """Default generation settings."""
@@ -275,6 +283,19 @@ class LLMProvider(ABC):
         self.api_key = api_key
         self.api_base = api_base
         self.generation: GenerationSettings = GenerationSettings()
+
+    def apply_transient_overlay(
+        self,
+        messages: list[dict[str, Any]],
+        overlay: Any,
+    ) -> TransientOverlayApplication:
+        """Return a provider-valid request copy for a model-only overlay.
+
+        Providers opt in explicitly. The default preserves the original
+        messages rather than guessing at a role or wire representation.
+        """
+        _ = overlay
+        return TransientOverlayApplication(list(messages), "omitted_unsupported")
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
