@@ -12,10 +12,12 @@ import httpx
 from loguru import logger
 from oauth_cli_kit import get_token as get_codex_token
 
+from nanobot.agent.context import SYSTEM_CONTEXT_SECTIONS_META, tool_schema_digest
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
     ToolCallRequest,
+    TransientOverlayApplication,
     resolve_stream_idle_timeout_s,
 )
 from nanobot.providers.openai_responses import (
@@ -42,6 +44,20 @@ class OpenAICodexProvider(LLMProvider):
         self.default_model = default_model
         self.proxy = proxy or None
 
+    def apply_transient_overlay(
+        self,
+        messages: list[dict[str, Any]],
+        overlay: Any,
+    ) -> TransientOverlayApplication:
+        """Represent trusted request status as a Responses developer item."""
+        content = getattr(overlay, "content", None)
+        if not isinstance(content, str) or not content.strip() or len(content) > 1000:
+            return TransientOverlayApplication(list(messages), "omitted_invalid")
+        return TransientOverlayApplication(
+            [*messages, {"role": "developer", "content": content}],
+            "applied",
+        )
+
     async def _call_codex(
         self,
         messages: list[dict[str, Any]],
@@ -65,7 +81,7 @@ class OpenAICodexProvider(LLMProvider):
             "input": input_items,
             "text": {"verbosity": "medium"},
             "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": _prompt_cache_key(messages[:2]),
+            "prompt_cache_key": _prompt_cache_key(messages, tools, model),
             "tool_choice": tool_choice or "auto",
             "parallel_tool_calls": True,
         }
@@ -242,8 +258,44 @@ async def _request_codex(
             )
 
 
-def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
-    raw = json.dumps(messages, ensure_ascii=True, sort_keys=True)
+_CODEX_CACHE_KEY_FORMAT_VERSION = 2
+
+
+def _prompt_cache_key(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    model: str,
+) -> str:
+    """Key Codex cache reuse on stable instructions and complete tool schemas only."""
+    stable_digest = None
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        meta = message.get("_meta")
+        sections = meta.get(SYSTEM_CONTEXT_SECTIONS_META) if isinstance(meta, dict) else None
+        value = sections.get("stable_system_digest") if isinstance(sections, dict) else None
+        if isinstance(value, str) and value:
+            stable_digest = value
+            break
+    if stable_digest is None:
+        stable_system = "\n".join(
+            str(message.get("content") or "")
+            for message in messages
+            if message.get("role") == "system"
+        )
+        stable_digest = hashlib.sha256(stable_system.encode("utf-8")).hexdigest()
+    raw = json.dumps(
+        {
+            "format_version": _CODEX_CACHE_KEY_FORMAT_VERSION,
+            "provider": "openai_codex",
+            "model": _strip_model_prefix(model),
+            "stable_system_digest": stable_digest,
+            "tool_schema_digest": tool_schema_digest(tools),
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

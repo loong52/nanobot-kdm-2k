@@ -76,6 +76,23 @@ async def test_required_tasks_are_selected_only_for_their_owner_run(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_status_snapshot_reads_owner_and_goal_without_persisting(tmp_path, monkeypatch):
+    sm = SessionManager(tmp_path)
+    _active(sm)
+    store = GoalOrchestrationStore(sm)
+    await _register(store, "owned-a", owner_run_id="run-a")
+    await _register(store, "owned-b", owner_run_id="run-b")
+    save = MagicMock()
+    monkeypatch.setattr(sm, "save", save)
+
+    goal, records = await store.status_snapshot("test:c1", "run-a")
+
+    assert goal["status"] == "active"
+    assert set(records) == {"owned-a"}
+    save.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_three_required_children_finish_out_of_order_without_lost_updates(tmp_path):
     sm = SessionManager(tmp_path)
     _active(sm)

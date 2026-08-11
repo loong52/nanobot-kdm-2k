@@ -12,6 +12,7 @@ from typing import Any, Mapping, MutableMapping
 
 from loguru import logger
 
+from nanobot.agent.status_overlay import LOGICAL_USER_REQUEST_ID_META
 from nanobot.session.goal_state import (
     goal_state_runtime_lines,
     sustained_goal_active,
@@ -231,6 +232,9 @@ def _internal_continuation_metadata(
     metadata = dict(message_metadata or {})
     metadata[INTERNAL_CONTINUATION_META] = True
     metadata[INTERNAL_CONTINUATION_KIND_META] = _GOAL_CONTINUATION_KIND
+    request_id = (message_metadata or {}).get(LOGICAL_USER_REQUEST_ID_META)
+    if isinstance(request_id, str) and request_id:
+        metadata[LOGICAL_USER_REQUEST_ID_META] = request_id
     if run_started_at is not None:
         metadata[INTERNAL_CONTINUATION_RUN_STARTED_AT_META] = float(run_started_at)
     for key in _STRIPPED_INBOUND_META_KEYS:

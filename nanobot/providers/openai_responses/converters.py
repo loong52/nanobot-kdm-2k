@@ -31,6 +31,15 @@ def convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str
             input_items.append(convert_user_message(content))
             continue
 
+        if role == "developer":
+            if not isinstance(content, str) or not content.strip():
+                continue
+            input_items.append({
+                "role": "developer",
+                "content": [{"type": "input_text", "text": content}],
+            })
+            continue
+
         if role == "assistant":
             if isinstance(content, str) and content:
                 message_id = _unique_item_id(f"msg_{idx}", used_item_ids)

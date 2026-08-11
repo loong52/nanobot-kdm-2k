@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nanobot.agent.status_overlay import LOGICAL_USER_REQUEST_ID_META
 from nanobot.bus.events import InboundMessage
 from nanobot.session.goal_state import (
     GOAL_STATE_KEY,
@@ -56,6 +57,7 @@ async def test_maybe_continue_turn_queues_internal_message():
                 "webui": True,
                 "original_command": "/goal",
                 "goal_requested": True,
+                LOGICAL_USER_REQUEST_ID_META: "logical-request-1",
             },
         ),
         session_key="feishu:c1",
@@ -79,6 +81,7 @@ async def test_maybe_continue_turn_queues_internal_message():
     assert queued.metadata["webui"] is True
     assert queued.metadata["message_id"] == "msg-1"
     assert queued.metadata["origin_message_id"] == "msg-0"
+    assert queued.metadata[LOGICAL_USER_REQUEST_ID_META] == "logical-request-1"
     assert queued.metadata["_wants_stream"] is True
     assert not explicit_goal_requested(queued.metadata)
     assert sustained_goal_turn(meta, message_metadata=queued.metadata)

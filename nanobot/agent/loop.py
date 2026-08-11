@@ -26,6 +26,12 @@ from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
+from nanobot.agent.status_overlay import (
+    LOGICAL_USER_REQUEST_ID_META,
+    FailureLedgerHook,
+    begin_logical_user_request,
+    build_status_overlay,
+)
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.context import RequestContext, bind_request_context, reset_request_context
 from nanobot.agent.tools.exec_session import ExecSessionManager
@@ -1040,6 +1046,16 @@ class AgentLoop:
                     if claimed is False or (claimed is None and goal_claim is False):
                         return
                 try:
+                    is_real_user_inbound = (
+                        pending_msg.channel != "system"
+                        and pending_msg.sender_id != "subagent"
+                        and not turn_continuation.internal_continuation_inbound(metadata)
+                        and not is_cron_turn(metadata)
+                        and local_trigger(metadata) is None
+                    )
+                    if is_real_user_inbound and session is not None:
+                        begin_logical_user_request(metadata, session.metadata)
+                        self.sessions.save(session)
                     items.append(_to_user_message(pending_msg))
                     if audit_context is not None:
                         turn = AuditTurnContext(
@@ -1147,6 +1163,28 @@ class AgentLoop:
 
         session_metadata = session.metadata if session is not None else None
 
+        async def _status_overlay():
+            if session is None:
+                return None
+            active_goal = None
+            owner_records = None
+            if audit_context is not None:
+                try:
+                    active_goal, owner_records = await self.goal_orchestration.status_snapshot(
+                        session.key,
+                        audit_context.run_id,
+                    )
+                except ValueError:
+                    # Ordinary and legacy sessions have no active Goal.  The
+                    # request-scoped failure ledger remains independently useful.
+                    pass
+            return build_status_overlay(
+                session.metadata,
+                None,
+                active_goal=active_goal,
+                owner_records=owner_records,
+            )
+
         async def _completion_guard(candidate: str | None, reason: str) -> dict[str, Any]:
             """Join only required children owned by this concrete Run."""
             from nanobot.session.goal_orchestration import (
@@ -1212,6 +1250,12 @@ class AgentLoop:
         try:
             for scope in turn_scopes or ():
                 turn_scope_stack.enter_context(scope)
+            turn_hooks = list(hooks or [])
+            if session is not None:
+                turn_hooks.append(FailureLedgerHook(
+                    session=session,
+                    sessions=self.sessions,
+                ))
             hook = build_agent_turn_hook(AgentTurnHookSpec(
                 on_progress=on_progress,
                 on_stream=on_stream,
@@ -1227,7 +1271,7 @@ class AgentLoop:
                 registered_hook_factories=self._hook_factories,
                 turn_hook_factories=list(hook_factories or []),
                 registered_hooks=self._extra_hooks,
-                turn_hooks=list(hooks or []),
+                turn_hooks=turn_hooks,
                 ephemeral=ephemeral,
                 run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             ))
@@ -1249,6 +1293,7 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                status_overlay_factory=_status_overlay,
                 # Sustained goals may legitimately exceed NANOBOT_LLM_TIMEOUT_S; idle stall
                 # is still capped by NANOBOT_STREAM_IDLE_TIMEOUT_S in streaming providers.
                 llm_timeout_s=runner_wall_llm_timeout_s(
@@ -1786,6 +1831,9 @@ class AgentLoop:
             raise
 
         if ctx.outbound is not None:
+            # The logical request ID belongs to the transient ledger only.
+            # It must not become channel-visible response metadata.
+            ctx.outbound.metadata.pop(LOGICAL_USER_REQUEST_ID_META, None)
             if (
                 ctx.kind is TurnKind.SYSTEM
                 or not getattr(self.audit_runtime.emitter, "audit_disabled", False)
@@ -1878,6 +1926,14 @@ class AgentLoop:
         if ctx.session is None:
             ctx.session = self.sessions.get_or_create(ctx.session_key)
         if ctx.kind is TurnKind.USER:
+            if (
+                msg.sender_id != "subagent"
+                and not turn_continuation.internal_continuation_inbound(msg.metadata)
+                and not is_cron_turn(msg.metadata)
+                and local_trigger(msg.metadata) is None
+            ):
+                begin_logical_user_request(msg.metadata, ctx.session.metadata)
+                self.sessions.save(ctx.session)
             await self._runtime_events().session_turn_started(msg, ctx.session_key)
             self.workspace_scopes.persist_message_scope(ctx.session, msg)
 

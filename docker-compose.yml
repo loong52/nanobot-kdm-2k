@@ -17,6 +17,12 @@ x-common-config: &common-config
     # Git-over-SSH and GitHub's API are separate authentication paths. Set a
     # fine-grained PAT in an ignored .env file to activate GitHub MCP tools.
     GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN:-}
+    # Containers do not inherit the host's proxy environment. Forward the
+    # standard variables so configured remote providers use the same route.
+    HTTP_PROXY: ${HTTP_PROXY:-}
+    HTTPS_PROXY: ${HTTPS_PROXY:-}
+    ALL_PROXY: ${ALL_PROXY:-}
+    NO_PROXY: ${NO_PROXY:-}
   cap_drop:
     - ALL
 
