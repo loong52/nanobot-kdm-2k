@@ -27,6 +27,7 @@ from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
 from nanobot.agent.runner import _MAX_INJECTIONS_PER_TURN, AgentRunner, AgentRunSpec
 from nanobot.agent.status_overlay import (
+    LOGICAL_USER_REQUEST_ID_META,
     FailureLedgerHook,
     begin_logical_user_request,
     build_status_overlay,
@@ -1830,6 +1831,9 @@ class AgentLoop:
             raise
 
         if ctx.outbound is not None:
+            # The logical request ID belongs to the transient ledger only.
+            # It must not become channel-visible response metadata.
+            ctx.outbound.metadata.pop(LOGICAL_USER_REQUEST_ID_META, None)
             if (
                 ctx.kind is TurnKind.SYSTEM
                 or not getattr(self.audit_runtime.emitter, "audit_disabled", False)
