@@ -18,6 +18,7 @@ from nanobot.providers.openai_codex_provider import (
     _request_codex,
     _should_retry_status,
 )
+from nanobot.providers.openai_responses import convert_messages
 from nanobot.providers.registry import find_by_name
 
 
@@ -37,6 +38,63 @@ def test_codex_default_model_matches_curated_flagship() -> None:
     assert spec is not None
     assert spec.builtin_models
     assert OpenAICodexProvider().get_default_model() == spec.builtin_models[0].id
+
+
+def test_codex_transient_overlay_is_a_developer_item_after_tool_output() -> None:
+    provider = OpenAICodexProvider()
+    overlay = SimpleNamespace(content="[Agent Status]\nRepeated failure: read_file same-operation failures=2; class=file_not_found\n[/Agent Status]")
+    application = provider.apply_transient_overlay(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": '{"path":"missing.txt"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "Error: missing"},
+        ],
+        overlay,
+    )
+
+    assert application.result == "applied"
+    assert application.messages[-1]["role"] == "developer"
+    _, input_items = convert_messages(application.messages)
+    assert [item.get("type") for item in input_items[-2:]] == ["function_call_output", None]
+    assert input_items[-1]["role"] == "developer"
+    assert input_items[-1]["content"][0]["text"] == overlay.content
+
+
+@pytest.mark.asyncio
+async def test_codex_transient_overlay_uses_developer_item_on_wire(monkeypatch) -> None:
+    bodies: list[dict] = []
+    _mock_codex_token(monkeypatch)
+
+    async def fake_request(_url, _headers, body, verify, **_kwargs):
+        _ = verify
+        bodies.append(body)
+        return "ok", [], "stop", {}, None
+
+    monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
+    provider = OpenAICodexProvider()
+    overlay = SimpleNamespace(content="[Agent Status]\nRepeated failure: read_file same-operation failures=2; class=file_not_found\n[/Agent Status]")
+    application = provider.apply_transient_overlay(
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "read_file", "arguments": '{"path":"missing.txt"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "Error: missing"},
+        ],
+        overlay,
+    )
+
+    await provider.chat(application.messages)
+
+    assert bodies[0]["input"][-2]["type"] == "function_call_output"
+    assert bodies[0]["input"][-1] == {
+        "role": "developer",
+        "content": [{"type": "input_text", "text": overlay.content}],
+    }
 
 
 class _WarningCaptureLogger:
@@ -173,7 +231,7 @@ async def test_codex_request_uses_configured_proxy(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatch) -> None:
+async def test_codex_prompt_cache_key_uses_stable_system_and_tool_schema(monkeypatch) -> None:
     bodies: list[dict] = []
 
     _mock_codex_token(monkeypatch)
@@ -195,27 +253,35 @@ async def test_codex_prompt_cache_key_uses_stable_conversation_prefix(monkeypatc
     monkeypatch.setattr("nanobot.providers.openai_codex_provider._request_codex", fake_request)
 
     provider = OpenAICodexProvider()
+    stable_meta = {
+        "system_context_sections": {
+            "stable_system_digest": "stable-system-v1",
+        }
+    }
     await provider.chat(
         [
-            {"role": "system", "content": "You are nanobot."},
+            {"role": "system", "content": "You are nanobot.\n\n---\n\nrecent-a", "_meta": stable_meta},
             {"role": "user", "content": "first request"},
             {"role": "assistant", "content": "first answer"},
         ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
     )
     await provider.chat(
         [
-            {"role": "system", "content": "You are nanobot."},
-            {"role": "user", "content": "first request"},
-            {"role": "assistant", "content": "first answer"},
-            {"role": "user", "content": "follow up"},
-        ],
-    )
-    await provider.chat(
-        [
-            {"role": "system", "content": "You are nanobot."},
+            {"role": "system", "content": "You are nanobot.\n\n---\n\nrecent-b", "_meta": stable_meta},
             {"role": "user", "content": "different request"},
             {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "follow up"},
+            {"role": "developer", "content": "[Agent Status] transient [/Agent Status]"},
         ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+    )
+    await provider.chat(
+        [
+            {"role": "system", "content": "You are nanobot.\n\n---\n\nrecent-b", "_meta": stable_meta},
+            {"role": "user", "content": "different request"},
+        ],
+        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
     )
 
     assert bodies[0]["prompt_cache_key"] == bodies[1]["prompt_cache_key"]

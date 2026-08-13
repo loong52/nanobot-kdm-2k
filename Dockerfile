@@ -5,6 +5,9 @@ COPY webui/package.json webui/package-lock.json ./webui/
 WORKDIR /app/webui
 RUN npm ci
 COPY webui/ ./
+# Channel-owned frontend modules are imported through Vite's glob from outside
+# webui/. The builder must see the same plugin tree as a repository build.
+COPY nanobot/channels/ /app/nanobot/channels/
 RUN mkdir -p /app/nanobot/web && npm run build
 
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
@@ -88,7 +91,11 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/ent
 # and fails closed if it cannot, so the agent never runs as root (see
 # entrypoint.sh).
 USER root
+ARG NANOBOT_BUILD_REF=unknown
+ARG NANOBOT_BUILD_TIME=unknown
 ENV HOME=/home/nanobot
+ENV NANOBOT_BUILD_REF=${NANOBOT_BUILD_REF}
+ENV NANOBOT_BUILD_TIME=${NANOBOT_BUILD_TIME}
 # Ensure crash output reaches Render logs (app output is otherwise swallowed on
 # non-graceful exit).
 ENV PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1

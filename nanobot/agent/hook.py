@@ -9,6 +9,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.tool_failure import NormalizedToolFailure
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 from nanobot.utils.llm_runtime import LLMRuntime
 
@@ -19,6 +20,8 @@ class ModelRequestSnapshot:
     messages: list[dict[str, Any]]
     tools: list[dict[str, Any]]
     runtime: LLMRuntime
+    agent_status: dict[str, Any] | None = None
+    context_cache: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +30,7 @@ class RuntimeDecision:
     fields: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ToolAuditOutcome:
     status: str
     result: Any
@@ -38,6 +41,8 @@ class ToolAuditOutcome:
     provider: str | None = None
     fatal: bool = False
     failure_policy: str | None = None
+    failure: NormalizedToolFailure | None = None
+    source_event_id: str | None = None
 
 
 @dataclass(slots=True)

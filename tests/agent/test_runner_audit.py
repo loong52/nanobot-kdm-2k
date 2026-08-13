@@ -1,15 +1,22 @@
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
-from nanobot.agent.runner import AgentRunner
+import pytest
+
+from nanobot.agent.runner import AgentRunner, AgentRunResult
+from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.await_subagents import AwaitSubagentsTool
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import RequestContext, request_context
-from nanobot.agent.tools.filesystem import ReadFileTool
+from nanobot.agent.tools.filesystem import ListDirTool, ReadFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.audit.context import AuditRunContext, set_run_cause
+from nanobot.audit.emitter import AuditEmitter
+from nanobot.audit.redaction import AuditRedactor
+from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from nanobot.session.goal_orchestration import GoalOrchestrationStore
 from nanobot.session.goal_state import GOAL_STATE_KEY
@@ -171,6 +178,221 @@ async def test_runner_emits_error_terminal_for_returned_tool_error() -> None:
     assert emitter.events[-1].status == "succeeded"
 
 
+async def test_list_dir_error_keeps_safe_diagnostics_without_payload_dependency(
+    tmp_path,
+) -> None:
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="missing-directory",
+                        name="list_dir",
+                        arguments={"path": "missing"},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="continued"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(
+        ListDirTool(
+            workspace=tmp_path,
+            allowed_dir=tmp_path,
+            restrict_to_workspace=True,
+        )
+    )
+    emitter = RecordingEmitter()
+
+    await AgentRunner(audit_emitter=emitter).run(
+        make_run_spec(
+            provider,
+            initial_messages=[],
+            tools=registry,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=10_000,
+            audit_context=AuditRunContext("trace", "turn", "run"),
+        )
+    )
+
+    terminal = next(event for event in emitter.events if event.event_type == "tool_finished")
+    assert terminal.status == "error"
+    assert terminal.error_message == "Error: Directory not found: missing"
+    assert terminal.error_summary == "Directory not found: missing"
+    assert terminal.error_type == "ToolError"
+    assert terminal.error_code == "tool_error"
+    assert terminal.error_source == "tool_result"
+    assert terminal.retryability == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expects_output_payload"),
+    [("metadata_only", False), ("full", True)],
+)
+async def test_list_dir_diagnostics_respect_payload_mode(
+    tmp_path,
+    mode: str,
+    expects_output_payload: bool,
+) -> None:
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="missing-directory",
+                    name="list_dir",
+                    arguments={"path": "missing"},
+                )],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="continued"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(ListDirTool(workspace=tmp_path, allowed_dir=tmp_path))
+    writer = AsyncMock()
+    emitter = AuditEmitter(writer=writer, redactor=AuditRedactor(), mode=mode)
+
+    await AgentRunner(audit_emitter=emitter).run(
+        make_run_spec(
+            provider,
+            initial_messages=[],
+            tools=registry,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=10_000,
+            audit_context=AuditRunContext("trace", "turn", "run"),
+        )
+    )
+
+    items = [call.args[0] for call in writer.submit.await_args_list]
+    terminal = next(item for item in items if item.event.event_type == "tool_finished")
+    assert terminal.event.error_message == "Error: Directory not found: missing"
+    assert terminal.event.error_source == "tool_result"
+    assert (terminal.payload is not None) is expects_output_payload
+    if mode == "metadata_only":
+        assert all(item.payload is None for item in items)
+
+
+async def test_prepare_validation_error_uses_complete_failure_contract() -> None:
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="invalid-list-dir",
+                        name="list_dir",
+                        arguments={},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="continued"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(ListDirTool())
+    emitter = RecordingEmitter()
+
+    await AgentRunner(audit_emitter=emitter).run(
+        make_run_spec(
+            provider,
+            initial_messages=[],
+            tools=registry,
+            model="test-model",
+            max_iterations=2,
+            max_tool_result_chars=10_000,
+            audit_context=AuditRunContext("trace", "turn", "run"),
+        )
+    )
+
+    terminal = next(event for event in emitter.events if event.event_type == "tool_finished")
+    assert terminal.error_message
+    assert terminal.error_summary
+    assert terminal.error_type == "ValidationError"
+    assert terminal.error_code == "invalid_tool_arguments"
+    assert terminal.error_source == "validation"
+    assert terminal.retryability == "non_retryable"
+
+
+async def test_runtime_emits_plugin_retry_and_exec_continuation_without_false_recovery() -> None:
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="plugin-1", name="mcp_example", arguments={"value": 1})],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="plugin-2", name="mcp_example", arguments={"value": 1})],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="session-1",
+                    name="write_stdin",
+                    arguments={"session_id": "proc-1", "chars": "input"},
+                )],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(
+                    id="session-2",
+                    name="write_stdin",
+                    arguments={"session_id": "proc-1", "chars": ""},
+                )],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="continued"),
+        ]
+    )
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.prepare_call.side_effect = lambda name, params: (None, params, None)
+    tools.execute = AsyncMock(
+        side_effect=[
+            ToolResult.error("Error: plugin unavailable"),
+            "plugin response",
+            ToolResult.error("Error: process output not ready"),
+            "Process running. session_id: proc-1",
+        ]
+    )
+    emitter = RecordingEmitter()
+
+    await AgentRunner(audit_emitter=emitter).run(
+        make_run_spec(
+            provider,
+            initial_messages=[],
+            tools=tools,
+            model="test-model",
+            max_iterations=5,
+            max_tool_result_chars=10_000,
+            audit_context=AuditRunContext("trace", "turn", "run"),
+        )
+    )
+
+    terminals = [event for event in emitter.events if event.event_type == "tool_finished"]
+    assert terminals[1].retry_of_tool_call_ids == [terminals[0].tool_call_id]
+    assert terminals[1].recovery_of_tool_call_ids == []
+    assert terminals[0].recovery_fallback == "unresolved"
+    assert terminals[3].continuation_of_tool_call_ids == [terminals[2].tool_call_id]
+    assert terminals[3].retry_of_tool_call_ids == []
+    assert terminals[3].recovery_of_tool_call_ids == []
+    assert terminals[2].recovery_fallback == "continued"
+
+
 async def test_fatal_tool_error_keeps_tool_domain_and_precise_event_link() -> None:
     provider = MagicMock(spec=LLMProvider)
     provider.chat_with_retry = AsyncMock(
@@ -217,6 +439,10 @@ async def test_fatal_tool_error_keeps_tool_domain_and_precise_event_link() -> No
     assert tool_finished.status == "timeout"
     assert tool_finished.error_type == "TimeoutError"
     assert tool_finished.error_code == "web_search_timeout"
+    assert tool_finished.error_message == "Error: DuckDuckGo search timed out after 30s"
+    assert tool_finished.error_summary == "DuckDuckGo search timed out after 30s"
+    assert tool_finished.error_source == "timeout"
+    assert tool_finished.retryability == "retryable"
     assert tool_finished.effective_timeout_ms == 30_000
     assert tool_finished.provider == "duckduckgo"
     assert run_finished.stop_reason == "tool_error"
@@ -435,6 +661,93 @@ async def test_successful_spawn_output_binds_audit_call_task_and_child_ids() -> 
     assert manager.kwargs["spawn_tool_call_id"] == terminal.tool_call_id
     assert json.loads(output["content"])["task_id"] == "task-a"
     assert json.loads(output["content"])["child_run_id"] == "child-a"
+
+
+async def test_three_spawn_calls_from_one_model_turn_overlap_in_execution(tmp_path) -> None:
+    provider = MagicMock(spec=LLMProvider)
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCallRequest(
+                    id=f"spawn-{index}",
+                    name="spawn",
+                    arguments={"task": f"independent task {index}"},
+                )
+                for index in range(3)
+            ],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(content="three tasks started"),
+    ])
+    manager = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=10_000,
+        max_concurrent_subagents=3,
+    )
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    started_at: dict[str, float] = {}
+    ended_at: dict[str, float] = {}
+
+    async def overlapping_child(spec):
+        objective = spec.initial_messages[-1]["content"]
+        started_at[objective] = time.monotonic()
+        if len(started_at) == 3:
+            all_started.set()
+        await release.wait()
+        ended_at[objective] = time.monotonic()
+        return AgentRunResult(
+            final_content=f"completed {objective}",
+            messages=[],
+            stop_reason="completed",
+        )
+
+    manager.runner.run = overlapping_child
+    tools = ToolRegistry()
+    tools.register(SpawnTool(manager))
+    spec = make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "run three independent checks"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=2,
+        max_tool_result_chars=10_000,
+        session_key="test:parallel",
+        audit_context=AuditRunContext("trace", "turn", "main-run"),
+    )
+    try:
+        with request_context(RequestContext(
+            channel="test",
+            chat_id="parallel",
+            session_key="test:parallel",
+            runtime=spec.runtime,
+            metadata={
+                "_audit_context": {
+                    "trace_id": "trace",
+                    "turn_id": "turn",
+                    "run_id": "main-run",
+                }
+            },
+        )):
+            main_run = asyncio.create_task(AgentRunner().run(spec))
+            await asyncio.wait_for(all_started.wait(), timeout=2)
+            assert manager.get_running_count() == 3
+            child_runs = list(manager._running_tasks.values())
+            result = await asyncio.wait_for(main_run, timeout=2)
+
+        release.set()
+        await asyncio.gather(*child_runs)
+        assert result.final_content == "three tasks started"
+        assert len(started_at) == len(ended_at) == 3
+        assert max(started_at.values()) < min(ended_at.values())
+        durable = manager._task_store.list_tasks()
+        assert len(durable) == 3
+        assert {str(task.status) for task in durable} == {"succeeded"}
+    finally:
+        release.set()
+        await manager.close()
 
 
 async def test_failed_await_subagents_is_nonfatal_and_structured_for_recovery(tmp_path) -> None:

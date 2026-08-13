@@ -14,6 +14,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.context import SYSTEM_CONTEXT_SECTIONS_META, SYSTEM_CONTEXT_SECTIONS_VERSION
 from nanobot.providers.base import (
     LLMProvider,
     LLMResponse,
@@ -198,7 +199,7 @@ class AnthropicProvider(LLMProvider):
             content = msg.get("content")
 
             if role == "system":
-                system = content if isinstance(content, (str, list)) else str(content or "")
+                system = self._system_sections_for_wire(msg, content)
                 continue
 
             if role == "tool":
@@ -230,6 +231,26 @@ class AnthropicProvider(LLMProvider):
                 continue
 
         return system, self._merge_consecutive(raw)
+
+    @staticmethod
+    def _system_sections_for_wire(msg: dict[str, Any], content: Any) -> str | list[dict[str, Any]]:
+        """Split ContextBuilder's stable prefix without placing metadata on the wire."""
+        meta = msg.get("_meta")
+        sections = meta.get(SYSTEM_CONTEXT_SECTIONS_META) if isinstance(meta, dict) else None
+        stable_chars = sections.get("stable_chars") if isinstance(sections, dict) else None
+        separator = "\n\n---\n\n"
+        if (
+            isinstance(content, str)
+            and isinstance(stable_chars, int)
+            and sections.get("schema_version") == SYSTEM_CONTEXT_SECTIONS_VERSION
+            and 0 < stable_chars < len(content)
+            and content[stable_chars:].startswith(separator)
+        ):
+            return [
+                {"type": "text", "text": content[:stable_chars], "_nanobot_stable_prefix": True},
+                {"type": "text", "text": content[stable_chars + len(separator):]},
+            ]
+        return content if isinstance(content, (str, list)) else str(content or "")
 
     @staticmethod
     def _tool_result_block(
@@ -496,8 +517,15 @@ class AnthropicProvider(LLMProvider):
         if isinstance(system, str) and system:
             system = [{"type": "text", "text": system, "cache_control": marker}]
         elif isinstance(system, list) and system:
-            system = list(system)
-            system[-1] = {**system[-1], "cache_control": marker}
+            stable_index = next(
+                (idx for idx, block in enumerate(system) if block.get("_nanobot_stable_prefix") is True),
+                len(system) - 1,
+            )
+            system = [
+                {key: value for key, value in block.items() if key != "_nanobot_stable_prefix"}
+                for block in system
+            ]
+            system[stable_index] = {**system[stable_index], "cache_control": marker}
 
         new_msgs = list(messages)
         if len(new_msgs) >= 3:
@@ -534,13 +562,33 @@ class AnthropicProvider(LLMProvider):
         supports_caching: bool = True,
     ) -> dict[str, Any]:
         model_name = self._strip_prefix(model or self.default_model)
-        system, anthropic_msgs = self._convert_messages(self._sanitize_empty_content(messages))
+        sanitized_messages = self._sanitize_empty_content(messages)
+        # Generic sanitization correctly strips all private metadata before a
+        # provider request. Preserve only the validated section descriptor on
+        # the local conversion copy so the stable system prefix can be marked.
+        for original, sanitized in zip(messages, sanitized_messages):
+            if original.get("role") != "system" or sanitized.get("role") != "system":
+                continue
+            original_meta = original.get("_meta")
+            sections = (
+                original_meta.get(SYSTEM_CONTEXT_SECTIONS_META)
+                if isinstance(original_meta, dict)
+                else None
+            )
+            if isinstance(sections, dict):
+                sanitized["_meta"] = {SYSTEM_CONTEXT_SECTIONS_META: dict(sections)}
+        system, anthropic_msgs = self._convert_messages(sanitized_messages)
         anthropic_tools = self._convert_tools(tools)
 
         if supports_caching:
             system, anthropic_msgs, anthropic_tools = self._apply_cache_control(
                 system, anthropic_msgs, anthropic_tools,
             )
+        elif isinstance(system, list):
+            system = [
+                {key: value for key, value in block.items() if key != "_nanobot_stable_prefix"}
+                for block in system
+            ]
 
         max_tokens = max(1, max_tokens)
         thinking_enabled = bool(reasoning_effort) and reasoning_effort.lower() != "none"

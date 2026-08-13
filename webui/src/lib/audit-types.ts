@@ -10,6 +10,7 @@ export type TraceDisplayStatus =
 
 export type AuditNodeType =
   | "run"
+  | "task"
   | "model_call"
   | "model_attempt"
   | "tool_call"
@@ -29,10 +30,17 @@ export type TraceEdgeType =
   | "retry"
   | "parent_run"
   | "resumed_from"
-  | "retry_of";
+  | "retry_of"
+  | "tool_retry"
+  | "tool_continuation"
+  | "tool_recovery"
+  | "task_execution"
+  | "task_replacement"
+  | "task_recovery";
 
 export type AuditRunKind = "main" | "child_agent" | "continuation" | "unknown";
 export type AuditLaneSide = "left" | "center" | "right";
+export type AuditCaptureMode = "full" | "metadata_only" | "off";
 
 export interface AuditIndexStatus {
   state: "ready" | "building" | "stale" | "disabled" | "unavailable";
@@ -41,6 +49,7 @@ export interface AuditIndexStatus {
   updated_at: string | null;
   lag_ms: number | null;
   last_error: { code: string; message: string; at: string | null } | null;
+  audit_mode?: AuditCaptureMode;
 }
 
 export interface AuditTraceListItem {
@@ -126,12 +135,17 @@ export interface AuditNodeSummary {
   error_type?: string | null;
   error_code?: string | null;
   error_summary?: string | null;
+  error_message?: string | null;
+  error_source?: string | null;
+  retryability?: string | null;
+  operation_evidence_kind?: string | null;
   failed_event_id?: string | null;
   effective_timeout_ms?: number | null;
   safe_input_summary?: string | null;
   impact?: "run_failed" | "run_continued" | "unknown" | "pending" | null;
-  recovery_status?: "recovered" | "unrecovered" | "continued" | "unknown" | "pending" | null;
+  recovery_status?: "recovered" | "unrecovered" | "continued" | "unresolved" | "pending" | null;
   recovered_by_event_id?: string | null;
+  recovery_evidence_kind?: string | null;
   evidence_source?: "recorded" | "legacy_inferred" | "unknown" | null;
   fatal_event_id?: string | null;
   failure_policy?: string | null;
@@ -140,6 +154,18 @@ export interface AuditNodeSummary {
   fatal_failure_count?: number | null;
   recovered_failure_count?: number | null;
   continued_failure_count?: number | null;
+  task_id?: string | null;
+  task_label?: string | null;
+  task_revision?: number | null;
+  task_status?: string | null;
+  task_phase?: string | null;
+  termination_state?: string | null;
+  delivery_phase?: string | null;
+  required_task?: boolean | null;
+  lifecycle_event_count?: number | null;
+  owner_run_id?: string | null;
+  child_run_id?: string | null;
+  replaces_task_id?: string | null;
 }
 
 export interface AuditNodeEventRef {
@@ -188,6 +214,7 @@ export interface AuditGraphNode {
   spawn_tool_call_id?: string | null;
   continuation_of_run_id?: string | null;
   injection_source?: string | null;
+  task_id?: string | null;
 }
 
 export interface AuditGraphResponse {
@@ -206,7 +233,7 @@ export interface AuditGraphResponse {
   focus: { turn_id: string | null; run_id: string | null };
   regions: Array<{
     id: string;
-    type: "turn" | "iteration" | "unscoped" | "lane";
+    type: "turn" | "iteration" | "unscoped" | "lane" | "task";
     label: string;
     status: TraceDisplayStatus;
     parent_region_id: string | null;
@@ -220,6 +247,7 @@ export interface AuditGraphResponse {
     lane_side?: AuditLaneSide | null;
     terminal_status?: TraceDisplayStatus | null;
     health_status?: TraceDisplayStatus | null;
+    task_id?: string | null;
   }>;
   nodes: AuditGraphNode[];
   edges: Array<{
@@ -229,6 +257,7 @@ export interface AuditGraphResponse {
     source: string;
     target: string;
     anchor?: { source_event_id?: string | null; target_event_id?: string | null } | null;
+    evidence_kind?: string | null;
   }>;
   first_anomaly: {
     node_id: string;
@@ -252,7 +281,18 @@ export interface AuditGraphResponse {
   }>;
   ignored_event_ids: string[];
   integrity: { status: string; error_codes: string[]; warning_codes: string[] };
-  index: { revision: number; coverage_complete: boolean; lag_ms: number | null };
+  index: { revision: number; coverage_complete: boolean; lag_ms: number | null; audit_mode?: AuditCaptureMode };
+}
+
+export interface AuditGraphEdge {
+  id: string;
+  type: TraceEdgeType;
+  relation?: TraceEdgeType | null;
+  source: string;
+  target: string;
+  anchor?: { source_event_id?: string | null; target_event_id?: string | null } | null;
+  evidence_count?: number | null;
+  evidence_kind?: string | null;
 }
 
 export interface AuditEventItem {
@@ -282,7 +322,7 @@ export interface AuditEventPage {
   items: AuditEventItem[];
   next_cursor: string | null;
   total: number;
-  index: { revision: number };
+  index: { revision: number; audit_mode?: AuditCaptureMode };
 }
 
 export interface AuditPayloadResponse {

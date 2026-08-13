@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,7 +19,11 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults
 from nanobot.providers.base import GenerationSettings
-from nanobot.session.goal_orchestration import GoalOrchestrationStore, required_gate
+from nanobot.session.goal_orchestration import (
+    GoalOrchestrationStore,
+    deadline_remaining_seconds,
+    required_gate,
+)
 from nanobot.session.goal_state import GOAL_STATE_KEY
 from nanobot.session.manager import SessionManager
 from nanobot.utils.llm_runtime import LLMRuntime
@@ -42,6 +47,7 @@ async def _register(
     *,
     key: str = "test:c1",
     replaces: str | None = None,
+    owner_run_id: str | None = None,
 ) -> None:
     await store.register(
         key,
@@ -50,8 +56,40 @@ async def _register(
         group="research",
         child_run_id=f"run-{task_id}",
         spawn_tool_call_id=f"spawn-{task_id}",
+        owner_run_id=owner_run_id,
         replaces_task_id=replaces,
     )
+
+
+@pytest.mark.asyncio
+async def test_required_tasks_are_selected_only_for_their_owner_run(tmp_path):
+    sm = SessionManager(tmp_path)
+    _active(sm)
+    store = GoalOrchestrationStore(sm)
+    await _register(store, "owned-a", owner_run_id="run-a")
+    await _register(store, "owned-b", owner_run_id="run-b")
+
+    selected = await store.select_owner("test:c1", "run-a")
+
+    assert set(selected) == {"owned-a"}
+    assert selected["owned-a"]["deadline_at"]
+
+
+@pytest.mark.asyncio
+async def test_status_snapshot_reads_owner_and_goal_without_persisting(tmp_path, monkeypatch):
+    sm = SessionManager(tmp_path)
+    _active(sm)
+    store = GoalOrchestrationStore(sm)
+    await _register(store, "owned-a", owner_run_id="run-a")
+    await _register(store, "owned-b", owner_run_id="run-b")
+    save = MagicMock()
+    monkeypatch.setattr(sm, "save", save)
+
+    goal, records = await store.status_snapshot("test:c1", "run-a")
+
+    assert goal["status"] == "active"
+    assert set(records) == {"owned-a"}
+    save.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -156,6 +194,51 @@ async def test_runtime_recovery_marks_missing_running_task_lost(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_startup_recovery_is_idempotent_and_preserves_original_deadline(tmp_path):
+    sm = SessionManager(tmp_path)
+    _active(sm)
+    store = GoalOrchestrationStore(sm)
+    await _register(store, "a", owner_run_id="owner-a")
+    before = sm.get_or_create("test:c1").metadata[GOAL_STATE_KEY]["orchestration"]["tasks"]["a"]
+    deadline = before["deadline_at"]
+
+    assert await store.recover_runtime(set()) == 1
+    assert await store.recover_runtime(set()) == 0
+    after = sm.get_or_create("test:c1").metadata[GOAL_STATE_KEY]["orchestration"]["tasks"]["a"]
+    assert after["deadline_at"] == deadline
+    assert after["status"] == "lost"
+    assert after["termination_state"] == "termination_failed"
+
+
+def test_durable_deadline_uses_original_absolute_utc_budget():
+    now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    deadline = (now + timedelta(seconds=17)).isoformat().replace("+00:00", "Z")
+
+    assert deadline_remaining_seconds(deadline, now=now + timedelta(seconds=5)) == 12
+    assert deadline_remaining_seconds(deadline, now=now + timedelta(seconds=18)) == 0
+
+
+@pytest.mark.asyncio
+async def test_duplicate_result_claim_preserves_pending_delivery_phase(tmp_path):
+    sm = SessionManager(tmp_path)
+    _active(sm)
+    store = GoalOrchestrationStore(sm)
+    await _register(store, "a", owner_run_id="owner-a")
+    await store.finish("test:c1", "a", "succeeded")
+
+    assert await store.claim_result("test:c1", "a") is True
+    assert await store.claim_result("test:c1", "a") is False
+    record = sm.get_or_create("test:c1").metadata[GOAL_STATE_KEY]["orchestration"]["tasks"]["a"]
+    assert record["result"]["claim_owner_run_id"] == "owner-a"
+    assert record["result"]["delivery_phase"] == "claimed_pending_delivery"
+
+    await store.mark_delivery("test:c1", "a", "delivered")
+    assert record["result"]["delivery_phase"] == "claimed_pending_delivery"
+    persisted = sm.get_or_create("test:c1").metadata[GOAL_STATE_KEY]["orchestration"]["tasks"]["a"]
+    assert persisted["result"]["delivery_phase"] == "delivered"
+
+
+@pytest.mark.asyncio
 async def test_await_subagents_timeout_waits_once_and_keeps_goal_active(tmp_path):
     sm = SessionManager(tmp_path)
     _active(sm)
@@ -199,8 +282,49 @@ async def test_required_spawn_without_active_goal_is_error_and_starts_nothing(tm
 
     assert isinstance(result, ToolResult) and result.is_error
     assert "active goal" in result
+    payload = json.loads(str(result).removeprefix("Error: "))
+    assert payload["reason"] == "no_active_goal"
     assert manager.get_running_count() == 0
     assert manager._task_statuses == {}
+    assert manager._task_store.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_required_replacement_is_rejected_before_task_creation(tmp_path):
+    from nanobot.agent.subagent import SubagentManager
+
+    sm = SessionManager(tmp_path)
+    _active(sm)
+    store = GoalOrchestrationStore(sm)
+    manager = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=AgentDefaults().max_tool_result_chars,
+        goal_orchestration=store,
+    )
+    tool = SpawnTool(manager)
+    with request_context(
+        RequestContext(
+            channel="test", chat_id="c1", session_key="test:c1", runtime=_runtime()
+        )
+    ):
+        result = await tool.execute(
+            task="replacement work",
+            required=True,
+            replaces_task_id="missing",
+        )
+
+    payload = json.loads(str(result).removeprefix("Error: "))
+    assert payload["reason"] == "required_registration_invalid"
+    assert manager._task_store.list_tasks() == []
+
+
+def test_spawn_description_separates_background_delivery_from_goal_barrier():
+    manager = MagicMock()
+    tool = SpawnTool(manager)
+
+    assert "never call await_subagents for required=false" in tool.description
+    assert "results are delivered asynchronously" in tool.description
 
 
 @pytest.mark.asyncio

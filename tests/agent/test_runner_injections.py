@@ -38,6 +38,10 @@ def _make_loop(tmp_path):
          patch("nanobot.agent.loop.SubagentManager") as mock_sub_mgr:
         mock_sub_mgr.return_value.cancel_by_session = AsyncMock(return_value=0)
         mock_sub_mgr.return_value.close = AsyncMock()
+        mock_sub_mgr.return_value.recover_runtime = AsyncMock(return_value=0)
+        mock_sub_mgr.return_value.claim_result = AsyncMock(return_value=None)
+        mock_sub_mgr.return_value.mark_result_delivered = AsyncMock(return_value=False)
+        mock_sub_mgr.return_value.mark_result_delivery_failed = AsyncMock(return_value=False)
         loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path)
     return loop
 
@@ -633,6 +637,41 @@ async def test_injection_cycles_capped_at_max():
     assert result.had_injections is True
     # Should be capped: _MAX_INJECTION_CYCLES injection rounds + 1 final round
     assert call_count["n"] == _MAX_INJECTION_CYCLES + 1
+
+
+@pytest.mark.asyncio
+async def test_completion_guard_rejects_candidate_without_persisting_it():
+    from nanobot.agent.runner import AgentRunner
+
+    provider = MagicMock()
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="premature answer", tool_calls=[], usage={}),
+        LLMResponse(content="answer after children", tool_calls=[], usage={}),
+    ])
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    decisions = iter([False, True])
+
+    async def guard(_candidate, _reason):
+        allow = next(decisions)
+        return {
+            "allow": allow,
+            "unresolved": [] if allow else [{"task_id": "required-1", "status": "running"}],
+        }
+
+    result = await AgentRunner().run(make_run_spec(
+        provider,
+        initial_messages=[{"role": "user", "content": "finish the work"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=3,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+        completion_guard=guard,
+    ))
+
+    assert result.final_content == "answer after children"
+    assert not any(message.get("content") == "premature answer" for message in result.messages)
+    assert result.messages[-1]["content"] == "answer after children"
 
 
 @pytest.mark.asyncio

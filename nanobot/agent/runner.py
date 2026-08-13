@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent.context import model_request_context_cache_metadata
 from nanobot.agent.context_governance import (
     ContextGovernanceConfig,
     ContextGovernor,
@@ -25,6 +26,7 @@ from nanobot.agent.hook import (
     RuntimeDecision,
     ToolAuditOutcome,
 )
+from nanobot.agent.tool_failure import ToolFailureSource, normalize_tool_failure
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.registry import ToolRegistry, is_tool_error_result
 from nanobot.audit.context import AuditRunContext
@@ -90,9 +92,12 @@ class AgentRunSpec:
     retry_wait_callback: Any | None = None
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
+    status_overlay_factory: Callable[[], Any] | None = None
     llm_timeout_s: float | None = None
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: GoalContinueMessage | None = None
+    completion_guard: Callable[[str | None, str], Any] | None = None
+    completion_guard_active_predicate: Callable[[], bool] | None = None
     finalize_on_max_iterations: bool = True
     audit_context: AuditRunContext | None = None
 
@@ -383,6 +388,37 @@ class AgentRunner:
             inflight_start_index=len(spec.initial_messages),
         )
 
+        async def guard_final(candidate: str | None, reason: str) -> bool:
+            if spec.completion_guard is None:
+                return True
+            try:
+                decision = await spec.completion_guard(candidate, reason)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Completion guard failed closed for {}", spec.session_key or "default"
+                )
+                return False
+            if not isinstance(decision, dict) or decision.get("allow") is True:
+                return True
+            for message in decision.get("injected_messages") or []:
+                if isinstance(message, dict) and message.get("role") and message.get("content"):
+                    messages.append(
+                        {"role": message["role"], "content": str(message["content"])[:2000]}
+                    )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Runtime completion barrier is unresolved. Continue the current Run; "
+                        "do not claim completion. Outstanding required task statuses: "
+                        f"{str(decision.get('unresolved') or [])[:1200]}"
+                    ),
+                }
+            )
+            return False
+
         for iteration in range(spec.max_iterations):
             # Keep the persisted conversation untouched. Context governance
             # may repair or compact historical messages for the model, but
@@ -479,6 +515,9 @@ class AgentRunner:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
                     stop_reason = "tool_error"
+                    if not await guard_final(final_content, stop_reason):
+                        await hook.after_iteration(context)
+                        continue
                     self._append_final_message(messages, final_content)
                     context.final_content = final_content
                     context.error = error
@@ -647,6 +686,9 @@ class AgentRunner:
                 stop_reason = "error"
                 error = final_content
                 error_kind = response.error_kind
+                if not await guard_final(final_content, stop_reason):
+                    await hook.after_iteration(context)
+                    continue
                 self._append_model_error_placeholder(messages)
                 context.final_content = final_content
                 context.error = error
@@ -664,6 +706,9 @@ class AgentRunner:
                 final_content = EMPTY_FINAL_RESPONSE_MESSAGE
                 stop_reason = "empty_final_response"
                 error = final_content
+                if not await guard_final(final_content, stop_reason):
+                    await hook.after_iteration(context)
+                    continue
                 self._append_final_message(messages, final_content)
                 context.final_content = final_content
                 context.error = error
@@ -677,6 +722,10 @@ class AgentRunner:
                     had_injections = True
                     continue
                 break
+
+            if not await guard_final(clean, stop_reason):
+                await hook.after_iteration(context)
+                continue
 
             messages.append(assistant_message or build_assistant_message(
                 clean,
@@ -736,7 +785,11 @@ class AgentRunner:
                 )
             if final_content is None:
                 final_content = self._max_iterations_fallback(spec)
-            self._append_final_message(messages, final_content)
+            if await guard_final(final_content, stop_reason):
+                self._append_final_message(messages, final_content)
+            else:
+                final_content = None
+                stop_reason = "completion_blocked"
 
         return AgentRunResult(
             final_content=final_content,
@@ -770,6 +823,43 @@ class AgentRunner:
         kwargs["reasoning_effort"] = generation.reasoning_effort
         return kwargs
 
+    @staticmethod
+    async def _apply_status_overlay(
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Build one provider-owned transient request overlay, if facts require it."""
+        if spec.status_overlay_factory is None:
+            return messages, None
+        try:
+            overlay = spec.status_overlay_factory()
+            if inspect.isawaitable(overlay):
+                overlay = await overlay
+        except Exception:
+            logger.exception("Agent Status overlay fact read failed for {}", spec.session_key or "default")
+            return messages, {"overlay_result": "omitted_invalid"}
+        if overlay is None:
+            return messages, None
+        try:
+            application = spec.runtime.provider.apply_transient_overlay(messages, overlay)
+            result = application.result
+            request_messages = application.messages
+            if result not in {"applied", "omitted_unsupported", "omitted_invalid"}:
+                raise ValueError("invalid overlay result")
+            if not isinstance(request_messages, list) or not all(
+                isinstance(message, dict) for message in request_messages
+            ):
+                raise ValueError("invalid overlay request messages")
+        except Exception:
+            logger.exception("Agent Status overlay application failed for {}", spec.session_key or "default")
+            result = "omitted_invalid"
+            request_messages = messages
+        audit_metadata = overlay.audit_metadata(result)
+        audit_metadata["overlay_tokens"] = estimate_message_tokens(
+            {"role": "developer", "content": overlay.content}
+        )
+        return request_messages, audit_metadata
+
     async def _request_model(
         self,
         spec: AgentRunSpec,
@@ -792,9 +882,10 @@ class AgentRunner:
         if timeout_s is not None and timeout_s <= 0:
             timeout_s = None
 
+        request_messages, status_metadata = await self._apply_status_overlay(spec, messages)
         kwargs = self._build_request_kwargs(
             spec,
-            messages,
+            request_messages,
             tools=spec.tools.get_definitions(),
         )
         model_call_id = new_audit_id()
@@ -806,11 +897,23 @@ class AgentRunner:
                 messages=deepcopy(messages),
                 tools=deepcopy(kwargs["tools"] or []),
                 runtime=spec.runtime,
+                agent_status=status_metadata,
+                context_cache=model_request_context_cache_metadata(
+                    messages,
+                    kwargs["tools"] or [],
+                    overlay_tokens=(status_metadata or {}).get("overlay_tokens", 0),
+                ),
             ),
         )
         if context.provider_attempt_observer is not None:
             kwargs["attempt_observer"] = context.provider_attempt_observer
-        wants_streaming = hook.wants_streaming()
+        # A guarded Run cannot expose irreversible final tokens before the
+        # completion decision; the Loop may still emit a post-guard final.
+        guard_active = (
+            spec.completion_guard_active_predicate is not None
+            and spec.completion_guard_active_predicate()
+        )
+        wants_streaming = hook.wants_streaming() and not guard_active
         wants_progress_streaming = (
             not wants_streaming
             and spec.stream_progress_deltas
@@ -1081,7 +1184,8 @@ class AgentRunner:
             messages=messages,
             session_key=spec.session_key,
         )
-        kwargs = self._build_request_kwargs(spec, messages, tools=None)
+        request_messages, status_metadata = await self._apply_status_overlay(spec, messages)
+        kwargs = self._build_request_kwargs(spec, request_messages, tools=None)
         model_call_id = new_audit_id()
         context.model_call_id = model_call_id
         await hook.before_model_request(
@@ -1091,6 +1195,12 @@ class AgentRunner:
                 messages=deepcopy(messages),
                 tools=[],
                 runtime=spec.runtime,
+                agent_status=status_metadata,
+                context_cache=model_request_context_cache_metadata(
+                    messages,
+                    [],
+                    overlay_tokens=(status_metadata or {}).get("overlay_tokens", 0),
+                ),
             ),
         )
         if context.provider_attempt_observer is not None:
@@ -1264,7 +1374,12 @@ class AgentRunner:
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
-        outcome = ToolAuditOutcome("error", None, "internal_error")
+        outcome = ToolAuditOutcome(
+            "error",
+            None,
+            "internal_error",
+            source_event_id=new_audit_id(),
+        )
         try:
             result = await self._run_tool_inner(
                 spec,
@@ -1281,6 +1396,23 @@ class AgentRunner:
                 marker in detail for marker in ("blocked", "violation", "boundary")
             ):
                 status = "blocked"
+            raw_error_type = getattr(payload, "error_type", None)
+            if status == "blocked":
+                failure_source: ToolFailureSource = "policy"
+                raw_error_type = "PolicyError"
+                raw_error_code = "policy_blocked"
+            elif raw_error_type in {"Timeout", "TimeoutError"}:
+                failure_source = "timeout"
+                raw_error_code = getattr(payload, "error_code", None)
+            elif getattr(payload, "error_source", None):
+                failure_source = getattr(payload, "error_source")
+                raw_error_code = getattr(payload, "error_code", None)
+            elif getattr(payload, "provider", None):
+                failure_source = "provider"
+                raw_error_code = getattr(payload, "error_code", None)
+            else:
+                failure_source = "tool_result"
+                raw_error_code = getattr(payload, "error_code", None)
             outcome = ToolAuditOutcome(
                 status=status,
                 result=payload,
@@ -1291,15 +1423,48 @@ class AgentRunner:
                 provider=getattr(payload, "provider", None),
                 fatal=fatal_error is not None,
                 failure_policy="fail_on_tool_error" if fatal_error is not None else None,
+                failure=(
+                    normalize_tool_failure(
+                        str(payload or "Tool execution failed"),
+                        source=failure_source,
+                        error_type=raw_error_type
+                        or (type(fatal_error).__name__ if fatal_error else None),
+                        error_code=raw_error_code,
+                        retryability=getattr(payload, "retryability", None),
+                    )
+                    if status != "ok"
+                    else None
+                ),
             )
             return result
         except asyncio.CancelledError:
-            outcome = ToolAuditOutcome("cancelled", None, "task_cancelled")
+            outcome = ToolAuditOutcome(
+                "cancelled",
+                None,
+                "task_cancelled",
+                failure=normalize_tool_failure(
+                    "Tool execution cancelled",
+                    source="cancelled",
+                    error_type="CancelledError",
+                ),
+            )
             raise
         except BaseException as error:
-            outcome = ToolAuditOutcome("error", None, type(error).__name__)
+            source = "timeout" if isinstance(error, TimeoutError) else "runtime"
+            outcome = ToolAuditOutcome(
+                "error",
+                None,
+                type(error).__name__,
+                failure=normalize_tool_failure(
+                    f"Error: {type(error).__name__}: {error}",
+                    source=source,
+                    error_type=type(error).__name__,
+                ),
+            )
             raise
         finally:
+            if outcome.source_event_id is None:
+                outcome.source_event_id = new_audit_id()
             await hook.after_execute_tool_terminal(
                 context,
                 tool_call,
@@ -1326,14 +1491,25 @@ class AgentRunner:
             external_lookup_counts,
         )
         if lookup_error:
+            lookup_result = ToolResult.error(
+                lookup_error,
+                error_type="PolicyError",
+                error_code="policy_blocked",
+                error_source="policy",
+                retryability="non_retryable",
+            )
             event = {
                 "name": tool_call.name,
                 "status": "error",
                 "detail": "repeated external lookup blocked",
             }
             if spec.fail_on_tool_error:
-                return lookup_error + hint, event, RuntimeError(lookup_error)
-            return lookup_error + hint, event, None
+                return (
+                    lookup_result.with_content(lookup_error + hint),
+                    event,
+                    RuntimeError(lookup_error),
+                )
+            return lookup_result.with_content(lookup_error + hint), event, None
         prepare_call = getattr(spec.tools, "prepare_call", None)
         tool, params, prep_error = None, tool_call.arguments, None
         if callable(prepare_call):
@@ -1355,7 +1531,18 @@ class AgentRunner:
             )
             if handled is not None:
                 return handled
-            return prep_error + hint, event, (
+            prep_payload = (
+                prep_error.with_content(str(prep_error) + hint)
+                if isinstance(prep_error, ToolResult)
+                else ToolResult.error(
+                    str(prep_error) + hint,
+                    error_type="ValidationError",
+                    error_code="invalid_tool_arguments",
+                    error_source="validation",
+                    retryability="non_retryable",
+                )
+            )
+            return prep_payload, event, (
                 RuntimeError(prep_error) if spec.fail_on_tool_error else None
             )
         await hook.before_execute_tool(context, tool_call, tool, params)
@@ -1373,7 +1560,12 @@ class AgentRunner:
                 "status": "error",
                 "detail": str(exc),
             }
-            payload = f"Error: {type(exc).__name__}: {exc}"
+            payload = ToolResult.error(
+                f"Error: {type(exc).__name__}: {exc}",
+                error_type=type(exc).__name__,
+                error_code="tool_exception",
+                error_source="exception",
+            )
             handled = self._classify_violation(
                 raw_text=str(exc),
                 # Preserve legacy exception payloads without the retry hint.

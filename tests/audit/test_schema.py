@@ -108,6 +108,25 @@ def test_materialize_event_adds_persistence_fields() -> None:
     assert event.segment_sequence == 1
 
 
+def test_subagent_lifecycle_task_label_is_optional_and_round_trips() -> None:
+    model = EVENT_DRAFT_MODELS[EventType.SUBAGENT_CREATED]
+    common = {
+        **_common_event("subagent_created"),
+        "subagent_task_id": "task-a",
+        "task_revision": 1,
+        "idempotency_key": "task-a:1:subagent_created",
+        "task_status": "created",
+        "task_phase": "initializing",
+        "termination_state": "none",
+        "delivery_phase": "not_ready",
+        "required_task": True,
+        "legacy_inferred": False,
+    }
+
+    assert model.model_validate(common).task_label is None
+    assert model.model_validate({**common, "task_label": "检查一级目录"}).task_label == "检查一级目录"
+
+
 def test_tool_finished_accepts_additive_diagnostics_and_recovery_link() -> None:
     draft = ToolFinishedDraft.model_validate(
         {
@@ -121,15 +140,43 @@ def test_tool_finished_accepts_additive_diagnostics_and_recovery_link() -> None:
             "effective_timeout_ms": 30_000,
             "provider": "duckduckgo",
             "error_summary": "DuckDuckGo search timed out after 30s",
+            "error_message": "Error: DuckDuckGo search timed out after 30s",
+            "error_source": "timeout",
+            "retryability": "retryable",
             "safe_input_summary": "query omitted; provider=duckduckgo",
             "resource_key": None,
             "resource_correction_keys": [],
+            "retry_of_tool_call_ids": ["retry-call"],
+            "continuation_of_tool_call_ids": ["session-call"],
             "recovery_of_tool_call_ids": ["prior-call"],
+            "recovery_evidence_kind": "provider_receipt",
         }
     )
 
     assert draft.error_code == "web_search_timeout"
+    assert draft.error_message == "Error: DuckDuckGo search timed out after 30s"
+    assert draft.error_source == "timeout"
+    assert draft.retryability == "retryable"
+    assert draft.retry_of_tool_call_ids == ["retry-call"]
+    assert draft.continuation_of_tool_call_ids == ["session-call"]
     assert draft.recovery_of_tool_call_ids == ["prior-call"]
+    assert draft.recovery_evidence_kind == "provider_receipt"
+
+
+def test_legacy_tool_finished_without_diagnostics_remains_readable() -> None:
+    draft = ToolFinishedDraft.model_validate(
+        {
+            **_common_event("tool_finished"),
+            "tool_call_id": "legacy-call",
+            "tool_name": "legacy_plugin",
+            "elapsed_ms": 1,
+            "status": "error",
+        }
+    )
+
+    assert draft.error_message is None
+    assert draft.error_source is None
+    assert draft.retryability is None
 
 
 def test_rejects_naive_event_timestamp() -> None:

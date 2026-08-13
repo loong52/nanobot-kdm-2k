@@ -12,6 +12,7 @@ from typing import Any, Mapping, MutableMapping
 
 from loguru import logger
 
+from nanobot.agent.status_overlay import LOGICAL_USER_REQUEST_ID_META
 from nanobot.session.goal_state import (
     goal_state_runtime_lines,
     sustained_goal_active,
@@ -231,6 +232,9 @@ def _internal_continuation_metadata(
     metadata = dict(message_metadata or {})
     metadata[INTERNAL_CONTINUATION_META] = True
     metadata[INTERNAL_CONTINUATION_KIND_META] = _GOAL_CONTINUATION_KIND
+    request_id = (message_metadata or {}).get(LOGICAL_USER_REQUEST_ID_META)
+    if isinstance(request_id, str) and request_id:
+        metadata[LOGICAL_USER_REQUEST_ID_META] = request_id
     if run_started_at is not None:
         metadata[INTERNAL_CONTINUATION_RUN_STARTED_AT_META] = float(run_started_at)
     for key in _STRIPPED_INBOUND_META_KEYS:
@@ -247,14 +251,16 @@ def _goal_continuation_prompt(metadata: Mapping[str, Any] | None) -> str:
             "its tool-call budget.\n\n"
             f"{goal}\n\n"
             "Continue from the saved context. Do not mention the continuation "
-            "boundary to the user. Use tools as needed, and call update_goal "
-            "with action='complete' when the objective is truly finished."
+            "boundary to the user. Resolve every required subagent barrier for this "
+            "Goal before a final answer. Use tools as needed, and call update_goal "
+            "with action='complete' only when the objective and required tasks are finished."
         )
     return (
         "Continue the active sustained goal after the previous turn reached "
         "its tool-call budget. Continue from the saved context. Do not mention "
-        "the continuation boundary to the user. Use tools as needed, and call "
-        "update_goal with action='complete' when the objective is truly finished."
+        "the continuation boundary to the user. Resolve every required subagent "
+        "barrier before a final answer. Use tools as needed, and call update_goal "
+        "with action='complete' only when the objective and required tasks are finished."
     )
 
 

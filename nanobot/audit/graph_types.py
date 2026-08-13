@@ -11,6 +11,7 @@ from nanobot.audit.read_service import DisplayStatus
 
 AuditNodeType = Literal[
     "run",
+    "task",
     "model_call",
     "model_attempt",
     "tool_call",
@@ -31,10 +32,16 @@ AuditEdgeType = Literal[
     "parent_run",
     "resumed_from",
     "retry_of",
+    "tool_retry",
+    "tool_continuation",
+    "tool_recovery",
+    "task_execution",
+    "task_replacement",
+    "task_recovery",
 ]
 AuditRunKind = Literal["main", "child_agent", "continuation", "unknown"]
 AuditLaneSide = Literal["left", "center", "right"]
-RegionType = Literal["turn", "iteration", "unscoped", "lane"]
+RegionType = Literal["turn", "iteration", "unscoped", "lane", "task"]
 
 
 class AuditNodeSummary(BaseModel):
@@ -66,12 +73,17 @@ class AuditNodeSummary(BaseModel):
     error_type: str | None = None
     error_code: str | None = None
     error_summary: str | None = None
+    error_message: str | None = None
+    error_source: str | None = None
+    retryability: str | None = None
+    operation_evidence_kind: str | None = None
     failed_event_id: str | None = None
     effective_timeout_ms: int | None = None
     safe_input_summary: str | None = None
     impact: Literal["run_failed", "run_continued", "unknown", "pending"] | None = None
-    recovery_status: Literal["recovered", "unrecovered", "continued", "unknown", "pending"] | None = None
+    recovery_status: Literal["recovered", "unrecovered", "continued", "unresolved", "pending"] | None = None
     recovered_by_event_id: str | None = None
+    recovery_evidence_kind: str | None = None
     evidence_source: Literal["recorded", "legacy_inferred", "unknown"] | None = None
     fatal_event_id: str | None = None
     failure_policy: str | None = None
@@ -80,6 +92,18 @@ class AuditNodeSummary(BaseModel):
     fatal_failure_count: int | None = None
     recovered_failure_count: int | None = None
     continued_failure_count: int | None = None
+    task_id: str | None = None
+    task_label: str | None = None
+    task_revision: int | None = None
+    task_status: str | None = None
+    task_phase: str | None = None
+    termination_state: str | None = None
+    delivery_phase: str | None = None
+    required_task: bool | None = None
+    lifecycle_event_count: int | None = None
+    owner_run_id: str | None = None
+    child_run_id: str | None = None
+    replaces_task_id: str | None = None
 
 
 class AuditNodeRelation(BaseModel):
@@ -130,6 +154,7 @@ class AuditGraphNode(BaseModel):
     spawn_tool_call_id: str | None = None
     continuation_of_run_id: str | None = None
     injection_source: str | None = None
+    task_id: str | None = None
 
 
 class AuditEdgeAnchor(BaseModel):
@@ -144,6 +169,8 @@ class AuditGraphEdge(BaseModel):
     target: str
     relation: AuditEdgeType | None = None
     anchor: AuditEdgeAnchor | None = None
+    evidence_count: int | None = None
+    evidence_kind: str | None = None
 
 
 class AuditGraphRegion(BaseModel):
@@ -162,6 +189,7 @@ class AuditGraphRegion(BaseModel):
     lane_side: AuditLaneSide | None = None
     terminal_status: DisplayStatus | None = None
     health_status: DisplayStatus | None = None
+    task_id: str | None = None
 
 
 class CollapseGroup(BaseModel):

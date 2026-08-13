@@ -6,6 +6,7 @@ import {
   Link2,
   LocateFixed,
   Route,
+  Send,
   Timer,
   X,
 } from "lucide-react";
@@ -14,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import type { AuditGraphNode, AuditNodeEventRef, TraceEdgeType } from "@/lib/audit-types";
 import { auditStatusLabel, auditValueLabel } from "@/lib/audit-display";
 
-export type TraceFocusMode = "causal" | "context" | "branch" | "resume" | null;
+export type TraceFocusMode = "causal" | "context" | "branch" | "result" | "recovery" | null;
 
 export function TraceNodeInspector({
   node,
@@ -39,7 +40,8 @@ export function TraceNodeInspector({
     { mode: "causal", label: "因果链", icon: Link2 },
     { mode: "context", label: "执行上下文", icon: Activity },
     { mode: "branch", label: "结构分支", icon: GitBranch },
-    { mode: "resume", label: "恢复链路", icon: Route },
+    { mode: "result", label: "结果回传", icon: Send },
+    { mode: "recovery", label: "恢复关系", icon: Route },
   ];
   const suppressionReason = node.type === "delivery"
     && node.summary.delivery_result === "suppressed"
@@ -52,11 +54,28 @@ export function TraceNodeInspector({
     ["耗时", node.elapsed_ms == null ? null : `${node.elapsed_ms} ms`],
   ];
   const rowsByType: Partial<Record<AuditGraphNode["type"], Array<[string, unknown]>>> = {
+    task: [
+      ["Task ID", node.summary.task_id],
+      ["状态", node.summary.task_status ? auditValueLabel(node.summary.task_status) : null],
+      ["执行阶段", node.summary.task_phase ? auditValueLabel(node.summary.task_phase) : null],
+      ["终止状态", node.summary.termination_state ? auditValueLabel(node.summary.termination_state) : null],
+      ["交付阶段", node.summary.delivery_phase ? auditValueLabel(node.summary.delivery_phase) : null],
+      ["Required", node.summary.required_task],
+      ["Revision", node.summary.task_revision],
+      ["生命周期事件", node.summary.lifecycle_event_count],
+      ["Owner Run", node.summary.owner_run_id],
+      ["Child Run", node.summary.child_run_id],
+      ["替换 Task", node.summary.replaces_task_id],
+    ],
     tool_call: [
       ["Tool", node.summary.tool_name],
       ["安全输入", node.summary.safe_input_summary],
       ["错误类型", node.summary.error_type],
       ["错误码", node.summary.error_code],
+      ["错误来源", node.summary.error_source],
+      ["可重试性", node.summary.retryability],
+      ["操作证据", node.summary.operation_evidence_kind],
+      ["恢复证据", node.summary.recovery_evidence_kind],
       ["有效 timeout", node.summary.effective_timeout_ms == null ? null : `${node.summary.effective_timeout_ms} ms`],
       ["Iteration", node.iteration],
       ["Run ID", node.run_id],
@@ -116,9 +135,15 @@ export function TraceNodeInspector({
     recovered: "已由后续确定性调用恢复",
     unrecovered: "未恢复",
     continued: "未证明恢复，但 Run 已继续",
-    unknown: "恢复状态未知",
+    unresolved: "证据不足，恢复状态未决",
     pending: "恢复状态待定",
-  }[node.summary.recovery_status ?? "unknown"];
+  }[node.summary.recovery_status ?? "unresolved"];
+  const errorMessage = node.summary.error_message ?? node.summary.error_summary;
+  const isFailedTool = node.type === "tool_call" && Boolean(
+    node.summary.failure_kind
+    || errorMessage
+    || ["failed", "warning", "cancelled", "interrupted"].includes(node.status),
+  );
 
   return (
     <aside className="flex h-full min-h-0 w-full flex-col border-l border-border/60 bg-background" aria-label="节点检查器">
@@ -132,10 +157,12 @@ export function TraceNodeInspector({
         </Button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 text-xs">
-        {node.summary.error_summary ? (
+        {isFailedTool ? (
           <section className="mb-4 rounded-md border border-destructive/30 bg-destructive/5 p-3">
             <h3 className="text-[11px] font-semibold text-destructive">根因</h3>
-            <p className="mt-1 text-[12px] font-medium">{node.summary.error_summary}</p>
+            <p className="mt-1 whitespace-pre-wrap break-words text-[12px] font-medium">
+              {errorMessage ?? "历史版本未记录错误详情"}
+            </p>
             <p className="mt-2 text-[10.5px] text-muted-foreground">影响：{impactLabel}</p>
             <p className="mt-1 text-[10.5px] text-muted-foreground">恢复：{recoveryLabel}</p>
             {node.summary.evidence_source === "legacy_inferred" ? (
