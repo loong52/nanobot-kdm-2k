@@ -36,6 +36,20 @@ This file provides guidance to AI coding agents working with this repository.
 - 不要运行 `ruff format`；本仓库明确避免大范围格式化造成的历史噪声。机械清理不得混入功能提交。
 - 如果改动影响核心 Agent 流程、提示词行为、持久化、安全边界、配置兼容性或 WebUI 协议契约，
   必须在 PR 正文中明确说明。
+- 完成一轮改动并验证通过后，必须根据以下规则判断是否需要重建 Docker 镜像，并在 PR 正文中
+  注明结论和原因。如果判定需要重建，同时提醒用户执行 `docker compose up -d --build`。
+
+  **Dockerfile 构建上下文**（多阶段：`webui-builder` → `uv` 运行时）：
+
+  | 需要重建（文件被 `COPY` 进镜像） | 不需要重建（不在镜像内或挂载为 volume） |
+  |---|---|
+  | `nanobot/` — Python 源码、内置技能、工具、频道 | `docs/`、`_other/` — 文档 |
+  | `webui/` — 前端源码（Stage 1 构建 → Stage 2 拷贝 dist） | `tests/` — 测试代码 |
+  | `pyproject.toml` — 依赖声明（`uv pip install` 读取） | `runtime/` — 运行时数据（volume 挂载） |
+  | `Dockerfile` — 构建指令本身 | 根目录 `.md` 文件（README、AGENTS、PROJECT-ANALYSIS 等） |
+  | `entrypoint.sh`、`scripts/`、`render-config.json`、`hatch_build.py` | 工作区 `skills/`（运行时加载，不依赖镜像内的内置技能） |
+
+  判定逻辑：改动只要命中左列任一目录/文件，就需要重建；仅命中右列则不需要。
 
 ## 运行目录卫生
 
