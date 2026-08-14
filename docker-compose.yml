@@ -8,6 +8,9 @@ x-common-config: &common-config
       NANOBOT_CHANNELS: ${NANOBOT_CHANNELS:-whatsapp}
       NANOBOT_BUILD_REF: ${NANOBOT_BUILD_REF:-unknown}
       NANOBOT_BUILD_TIME: ${NANOBOT_BUILD_TIME:-unknown}
+      # The nanobot-api service runs `serve`, which imports aiohttp. That dependency
+      # ships in the optional `api` extra, so it must be installed at build time.
+      NANOBOT_EXTRAS: ${NANOBOT_EXTRAS:-api}
   # The local WSL user and the image's nanobot user are both UID/GID 1000.
   # Starting non-root also keeps cap_drop: ALL compatible with entrypoint.sh.
   user: "1000:1000"
